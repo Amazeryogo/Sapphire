@@ -22,7 +22,7 @@
 #include <algorithm>
 
 enum class ShapeType { CIRCLE, SQUARE, TRIANGLE };
-enum class ObjectType { BALL, BOX, SPRING, PULLEY, WHEEL, MOTOR, CHASSIS, PIN, ROPE, WATER, POLYGON };
+enum class ObjectType { BALL, BOX, SPRING, PULLEY, WHEEL, MOTOR, CHASSIS, PIN, ROPE, WATER, POLYGON,GAS,BOMB };
 
 double random_double(double min, double max) {
     static std::mt19937 gen(std::random_device{}());
@@ -72,9 +72,11 @@ public:
     bool is_static;
     bool is_fluid;
     bool is_dragged = false;
+    bool is_gas = false;
     bool is_motor = false;
     bool is_bouncy = true;
     double angular_velocity = 0.0;
+    int fuse = -1;
     std::vector<QPointF> trail;
 
     PhysicsObject(double x, double y, double r = 18.0, double el = 0.8, double m = -1.0,
@@ -115,8 +117,11 @@ public:
         }
 
         if (is_motor) velocity.x += angular_velocity;
-
-        apply_force(gravity);
+        if (is_gas) {
+            velocity.x += random_double(-0.2, 0.2);
+        } else {
+            apply_force(gravity);
+        }
         velocity += acceleration;
 
         double safe_drag = std::max(0.0, std::min(air_resistance, 0.99));
@@ -322,7 +327,6 @@ protected:
                 finalize_polygon();
                 return;
             }
-            // Delete clicked object
             for (auto it = balls.rbegin(); it != balls.rend(); ++it) {
                 if ((v_pos - (*it)->position).length() <= (*it)->radius) {
                     remove_object((*it).get());
@@ -522,6 +526,19 @@ private:
                     node->is_bouncy = false; // Add this to keep water from bouncing
                 }
             }
+        } else if (active_tool == ObjectType::GAS) {
+            // Spawn a burst of gas particles
+            for (int i = 0; i < 400; ++i) {
+                auto node = spawn_at(x + random_double(-15, 15), y + random_double(-15, 15), ShapeType::CIRCLE, 6.0, 0.5);
+                node->is_gas = true;
+                node->is_bouncy = true;
+                node->color = QColor(150, 255, 100, 150);
+            }
+        } else if (active_tool == ObjectType::BOMB) {
+            // Spawn a heavy, dark grey bomb with a 120-frame fuse (~2 seconds)
+            auto obj = spawn_at(x, y, ShapeType::CIRCLE, 15, 10.0);
+            obj->color = QColor(30, 30, 30);
+            obj->fuse = 120;
         }
     }
 
@@ -642,21 +659,65 @@ private:
             }
         }
     }
+    void detonate_bomb(PhysicsObject* bomb) {
+            double blast_radius = 250.0; // How far the shockwave reaches
+            double max_force = 1500.0;   // The power of the shockwave
 
-    void game_loop() {
-        if (!is_paused) {
-            for (auto& s : springs) s.update();
-            for (auto& p : pulleys) p.update();
-            for (int i = 0; i < 4; ++i) {
-                for (auto& l : rigid_links) l.update();
+            for (auto& obj_ptr : balls) {
+                PhysicsObject* target = obj_ptr.get();
+                if (target == bomb || target->is_static) continue;
+
+                Vector delta = target->position - bomb->position;
+                double distance = delta.length();
+
+                // If the object is inside the blast radius
+                if (distance > 0 && distance < blast_radius) {
+                    // Calculate falloff: 1.0 at the center, 0.0 at the edge of the radius
+                    double falloff = 1.0 - (distance / blast_radius);
+
+                    // Direction of the push
+                    Vector push_dir = delta * (1.0 / distance);
+
+                    // Apply the force (square the falloff so it's more powerful at the center)
+                    double applied_force = max_force * (falloff * falloff);
+
+                    // Send the object flying! (Lighter objects fly faster)
+                    target->velocity += push_dir * (applied_force / target->mass);
+                }
             }
-            for (auto& b : balls) {
-                b->update(gravity, air_resistance, width(), height());
-            }
-            resolve_collisions();
         }
-        update();
-    }
+
+        void game_loop() {
+                if (!is_paused) {
+                    for (auto& s : springs) s.update();
+                    for (auto& p : pulleys) p.update();
+                    for (int i = 0; i < 4; ++i) {
+                        for (auto& l : rigid_links) l.update();
+                    }
+                    std::vector<PhysicsObject*> to_delete;
+                    for (auto& b : balls) {
+                        b->update(gravity, air_resistance, width(), height());
+
+                        if (b->fuse > 0) {
+                            b->fuse--;
+                            if (b->fuse % 10 < 5) b->color = QColor(255, 255, 255);
+                            else b->color = QColor(30, 30, 30);
+
+                            if (b->fuse == 0) {
+                                detonate_bomb(b.get());
+                                to_delete.push_back(b.get()); // Mark for removal
+                            }
+                        }
+                    }
+                    for (auto* bomb : to_delete) {
+                        remove_object(bomb);
+                    }
+                    // ---------------------------------
+
+                    resolve_collisions();
+                }
+                update();
+            }
 };
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -719,13 +780,13 @@ private slots:
         toolbox->setStyleSheet("background-color: #21252b; border-right: 1px solid #333;");
         QVBoxLayout* tb_layout = new QVBoxLayout(toolbox);
 
-        QLabel* l1 = new QLabel("<b style='color:#abb2bf; font-size:14px'>SPAWN TOOLS</b>");
+        QLabel* l1 = new QLabel("<b style='color:#abb2bf; font-size:14px'>TOOLS</b>");
         tb_layout->addWidget(l1);
 
         std::vector<std::pair<QString, ObjectType>> tools = {
             {"Ball", ObjectType::BALL}, {"Box", ObjectType::BOX}, {"Pin (Static)", ObjectType::PIN},
-            {"Draw Shape", ObjectType::POLYGON}, {"Rope Chain", ObjectType::ROPE}, {"Water Drop", ObjectType::WATER},
-            {"Motor", ObjectType::MOTOR}, {"Wheel", ObjectType::WHEEL}, {"Car Chassis", ObjectType::CHASSIS}
+            {"Draw Shape", ObjectType::POLYGON}, {"Gas Cloud", ObjectType::GAS},{"Rope Chain", ObjectType::ROPE}, {"Water Drop", ObjectType::WATER},
+            {"Motor", ObjectType::MOTOR}, {"Wheel", ObjectType::WHEEL}, {"Car Chassis", ObjectType::CHASSIS},{"Shockwave Bomb", ObjectType::BOMB}
         };
 
         for (auto& t : tools) {
@@ -876,11 +937,15 @@ private slots:
                 canvas->gravity.y = grav_slider->value() / 100.0;
                 canvas->air_resistance = wind_slider->value() / 1000.0;
                 canvas->elasticity = elas_slider->value() / 100.0;
+
                 for (auto& ball : canvas->balls) {
-                    ball->elasticity = canvas->elasticity;
+                    // ONLY update objects that are meant to be bouncy
+                    if (ball->is_bouncy) {
+                        ball->elasticity = canvas->elasticity;
+                    }
                 }
-            }
-    };
+        }
+        };
 #include "main.moc"
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
