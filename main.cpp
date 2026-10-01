@@ -22,7 +22,7 @@
 #include <algorithm>
 
 enum class ShapeType { CIRCLE, SQUARE, TRIANGLE };
-enum class ObjectType { BALL, BOX, SPRING, PULLEY, WHEEL, MOTOR, CHASSIS, PIN, ROPE, WATER, POLYGON,GAS,BOMB };
+enum class ObjectType { BALL, BOX, SPRING, PULLEY, WHEEL, MOTOR, CHASSIS, PIN, ROPE, WATER, GAS, POLYGON, HEATER, COOLER, BOMB, PISTON, CONTAINER };
 
 double random_double(double min, double max) {
     static std::mt19937 gen(std::random_device{}());
@@ -59,6 +59,7 @@ bool is_valid(const Vector& val) {
 bool is_valid(double val) {
     return !(std::isnan(val) || std::isinf(val));
 }
+
 class PhysicsObject {
 public:
     Vector position;
@@ -71,12 +72,18 @@ public:
     ShapeType shape_type;
     bool is_static;
     bool is_fluid;
-    bool is_dragged = false;
     bool is_gas = false;
+    bool is_dragged = false;
     bool is_motor = false;
     bool is_bouncy = true;
     double angular_velocity = 0.0;
+    double temperature = 20.0;
+    bool is_heater = false;
+    bool is_cooler = false;
+    bool is_steam = false;
+    bool is_ice = false;
     int fuse = -1;
+
     std::vector<QPointF> trail;
 
     PhysicsObject(double x, double y, double r = 18.0, double el = 0.8, double m = -1.0,
@@ -117,27 +124,60 @@ public:
         }
 
         if (is_motor) velocity.x += angular_velocity;
+
+        // --- THERMODYNAMICS ---
+        temperature += (20.0 - temperature) * 0.005; // Ambient cooling
+        double speed = velocity.length();
+        if (speed > 2.0) temperature += (speed * 0.05); // Kinetic heating
+
+        if (is_heater) temperature = 300.0;
+        if (is_cooler) temperature = -100.0;
+
+        // Phase changes
+        if (is_fluid && temperature > 100.0) {
+            is_fluid = false; is_gas = true;
+            color = QColor(200, 200, 200, 150); // Steam
+            is_steam = true;
+        }
+        if (is_gas && temperature < 80.0 && is_steam) {
+            is_gas = false; is_fluid = true;
+            color = QColor(60, 150, 255, 200); // Water
+            is_steam = false;
+        }
+        if (is_fluid && temperature < 0.0) {
+            is_fluid = false; is_gas = true;
+            color = QColor(150, 255, 100, 150); // Ice
+            is_ice = true;
+        }
+        if (is_gas && temperature > 0.0 && is_ice) {
+            is_gas = false; is_fluid = true;
+            color = QColor(60, 150, 255, 200); // Water
+            is_ice = false;
+        }
+
+
         if (is_gas) {
+            double lift = std::max(0.2, (temperature / 100.0));
             velocity.x += random_double(-0.2, 0.2);
         } else {
             apply_force(gravity);
         }
+
         velocity += acceleration;
 
         double safe_drag = std::max(0.0, std::min(air_resistance, 0.99));
         velocity = velocity * (1.0 - safe_drag);
 
         double max_speed = 150.0;
-        double current_speed = velocity.length();
-        if (current_speed > max_speed) {
-            velocity = velocity * (max_speed / current_speed);
+        if (velocity.length() > max_speed) {
+            velocity = velocity * (max_speed / velocity.length());
         }
 
         position += velocity;
         acceleration = Vector(0, 0, 0);
 
         handle_wall_collisions(bounds_width, bounds_height);
-        if (!is_fluid) update_trail();
+        if (!is_fluid && !is_gas) update_trail();
     }
 
     void update_trail() {
@@ -165,6 +205,7 @@ private:
         }
     }
 };
+
 class Spring {
 public:
     PhysicsObject* obj_a;
@@ -251,6 +292,41 @@ public:
     }
 };
 
+class PistonLink {
+public:
+    PhysicsObject* obj_a;
+    PhysicsObject* obj_b;
+    double min_len;
+    double max_len;
+    double phase;
+    double speed;
+
+    PistonLink(PhysicsObject* a, PhysicsObject* b, double min_l, double max_l, double s = 0.05)
+        : obj_a(a), obj_b(b), min_len(min_l), max_len(max_l), phase(0), speed(s) {}
+
+    void update() {
+        phase += speed;
+        double target_length = min_len + (max_len - min_len) * (std::sin(phase) + 1.0) / 2.0;
+
+        Vector delta = obj_b->position - obj_a->position;
+        double dist = delta.length();
+        if (dist == 0) return;
+
+        double error = dist - target_length;
+        Vector direction = delta * (1.0 / dist);
+
+        double inv_mass_a = obj_a->is_static ? 0 : 1.0 / obj_a->mass;
+        double inv_mass_b = obj_b->is_static ? 0 : 1.0 / obj_b->mass;
+        double sum_mass = inv_mass_a + inv_mass_b;
+        if (sum_mass == 0) return;
+
+        double correction = error / sum_mass;
+
+        if (!obj_a->is_static) obj_a->position += direction * (correction * inv_mass_a);
+        if (!obj_b->is_static) obj_b->position -= direction * (correction * inv_mass_b);
+    }
+};
+
 // ==========================================
 // PHYSICS CANVAS
 // ==========================================
@@ -266,6 +342,7 @@ public:
     std::vector<Spring> springs;
     std::vector<Pulley> pulleys;
     std::vector<RigidLink> rigid_links;
+    std::vector<PistonLink> pistons;
 
     PhysicsObject* dragged_ball = nullptr;
     QPointF last_mouse_pos;
@@ -284,7 +361,7 @@ public:
     }
 
     void restart(int num_balls) {
-        balls.clear(); springs.clear(); pulleys.clear(); rigid_links.clear();
+        balls.clear(); springs.clear(); pulleys.clear(); rigid_links.clear(); pistons.clear();
         dragged_ball = nullptr; connection_start_obj = nullptr;
         update();
     }
@@ -292,7 +369,6 @@ public:
     void set_tool(ObjectType tool_type) { active_tool = tool_type; }
 
     void remove_object(PhysicsObject* obj) {
-        // Erase constraints referencing this pointer
         springs.erase(std::remove_if(springs.begin(), springs.end(),
             [obj](const Spring& s) { return s.obj_a == obj || s.obj_b == obj; }), springs.end());
 
@@ -302,7 +378,9 @@ public:
         pulleys.erase(std::remove_if(pulleys.begin(), pulleys.end(),
             [obj](const Pulley& p) { return p.obj_a == obj || p.obj_b == obj; }), pulleys.end());
 
-        // Erase the object itself
+        pistons.erase(std::remove_if(pistons.begin(), pistons.end(),
+            [obj](const PistonLink& p) { return p.obj_a == obj || p.obj_b == obj; }), pistons.end());
+
         balls.erase(std::remove_if(balls.begin(), balls.end(),
             [obj](const std::shared_ptr<PhysicsObject>& b) { return b.get() == obj; }), balls.end());
     }
@@ -356,7 +434,7 @@ protected:
             }
 
             if (clicked_obj) {
-                if (active_tool == ObjectType::SPRING || active_tool == ObjectType::PULLEY) {
+                if (active_tool == ObjectType::SPRING || active_tool == ObjectType::PULLEY || active_tool == ObjectType::PISTON) {
                     connection_start_obj = clicked_obj;
                 } else {
                     dragged_ball = clicked_obj;
@@ -392,16 +470,24 @@ protected:
                 dragged_ball = nullptr;
             } else if (connection_start_obj) {
                 QPointF pos = event->position();
+
                 for (auto it = balls.rbegin(); it != balls.rend(); ++it) {
-                    PhysicsObject* ball = (*it).get();
-                    if (ball != connection_start_obj && (Vector(pos.x(), pos.y()) - ball->position).length() <= ball->radius) {
+                    PhysicsObject* target_ball = (*it).get();
+
+                    if (target_ball != connection_start_obj && (Vector(pos.x(), pos.y()) - target_ball->position).length() <= target_ball->radius) {
+
                         if (active_tool == ObjectType::SPRING) {
-                            double dist = (connection_start_obj->position - ball->position).length();
-                            springs.emplace_back(connection_start_obj, ball, std::max(dist, 10.0));
+                            double dist = (connection_start_obj->position - target_ball->position).length();
+                            springs.emplace_back(connection_start_obj, target_ball, std::max(dist, 10.0));
+
+                        } else if (active_tool == ObjectType::PISTON) {
+                            double dist = (connection_start_obj->position - target_ball->position).length();
+                            pistons.emplace_back(connection_start_obj, target_ball, dist * 0.5, dist * 1.5, 0.05);
+
                         } else if (active_tool == ObjectType::PULLEY) {
-                            double anchor_x = (connection_start_obj->position.x + ball->position.x) / 2.0;
-                            double anchor_y = std::min(connection_start_obj->position.y, ball->position.y) - 100.0;
-                            pulleys.emplace_back(connection_start_obj, ball, Vector(anchor_x, std::max(10.0, anchor_y)));
+                            double anchor_x = (connection_start_obj->position.x + target_ball->position.x) / 2.0;
+                            double anchor_y = std::min(connection_start_obj->position.y, target_ball->position.y) - 100.0;
+                            pulleys.emplace_back(connection_start_obj, target_ball, Vector(anchor_x, std::max(10.0, anchor_y)));
                         }
                         break;
                     }
@@ -449,6 +535,12 @@ protected:
                 painter.drawLine(l.obj_a->position.to_qpointf(), l.obj_b->position.to_qpointf());
         }
 
+        painter.setPen(QPen(QColor(255, 140, 50), 6));
+        for (const auto& l : pistons) {
+            if (is_valid(l.obj_a->position) && is_valid(l.obj_b->position))
+                painter.drawLine(l.obj_a->position.to_qpointf(), l.obj_b->position.to_qpointf());
+        }
+
         if (connection_start_obj && has_last_mouse) {
             painter.setPen(QPen(QColor(100, 200, 255, 200), 2, Qt::DashLine));
             painter.drawLine(connection_start_obj->position.to_qpointf(), last_mouse_pos);
@@ -458,7 +550,7 @@ protected:
             PhysicsObject* obj = obj_ptr.get();
             if (!is_valid(obj->position) || !is_valid(obj->radius)) continue;
 
-            if (obj->trail.size() > 2 && !obj->is_static && !obj->is_fluid) {
+            if (obj->trail.size() > 2 && !obj->is_static && !obj->is_fluid && !obj->is_gas) {
                 QPen t_pen(obj->color);
                 for (size_t i = 1; i < obj->trail.size(); ++i) {
                     int opacity = int(255 * (float(i) / obj->trail.size()));
@@ -469,9 +561,11 @@ protected:
                 }
             }
 
-            if (obj->is_static) painter.setPen(QPen(QColor(255, 255, 255), 2));
+            if (obj->fuse > 0) {
+                if (obj->fuse % 10 < 5) painter.setPen(QPen(QColor(255, 255, 255), 4));
+                else painter.setPen(QPen(QColor(255, 50, 50), 4));
+            } else if (obj->is_static) painter.setPen(QPen(QColor(255, 255, 255), 2));
             else if (obj->is_motor) painter.setPen(QPen(QColor(255, 255, 100), 3));
-            else if (obj->is_fluid) painter.setPen(Qt::NoPen);
             else painter.setPen(Qt::NoPen);
 
             painter.setBrush(QBrush(obj->color));
@@ -481,15 +575,63 @@ protected:
             } else if (obj->shape_type == ShapeType::SQUARE) {
                 double r = obj->radius;
                 painter.drawRect(QRectF(obj->position.x - r, obj->position.y - r, r * 2, r * 2));
-            } else if (obj->shape_type == ShapeType::TRIANGLE) {
-                double r = obj->radius;
-                QPolygonF poly;
-                poly << QPointF(obj->position.x, obj->position.y - r)
-                     << QPointF(obj->position.x - r, obj->position.y + r)
-                     << QPointF(obj->position.x + r, obj->position.y + r);
-                painter.drawPolygon(poly);
             }
         }
+
+        int gas_count = 0;
+        int ice_count = 0;
+        double total_temp = 0.0;
+        double min_x = width(), max_x = 0;
+        double min_y = height(), max_y = 0;
+
+
+        for (const auto& obj_ptr : balls) {
+            if (obj_ptr->is_gas) {
+                gas_count++;
+                total_temp += obj_ptr->temperature;
+                if (obj_ptr->position.x < min_x) min_x = obj_ptr->position.x;
+                if (obj_ptr->position.x > max_x) max_x = obj_ptr->position.x;
+                if (obj_ptr->position.y < min_y) min_y = obj_ptr->position.y;
+                if (obj_ptr->position.y > max_y) max_y = obj_ptr->position.y;
+            }
+            if (obj_ptr->is_ice) ice_count++;
+        }
+
+        if (gas_count > 0) {
+            double avg_temp = total_temp / gas_count;
+            double width_bb = std::max(10.0, max_x - min_x);
+            double height_bb = std::max(10.0, max_y - min_y);
+            double volume = width_bb * height_bb;
+            double pressure = (gas_count * std::max(1.0, avg_temp) * 5000.0) / volume;
+
+            painter.setPen(QPen(QColor(150, 255, 100, 80), 2, Qt::DashLine));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRect(QRectF(min_x - 10, min_y - 10, width_bb + 20, height_bb + 20));
+
+            painter.setBrush(QColor(20, 22, 28, 220));
+            painter.setPen(QPen(QColor(100, 150, 255), 1));
+            painter.drawRoundedRect(10, 10, 240, 120, 8, 8);
+
+            painter.setPen(Qt::white);
+            painter.setFont(QFont("Consolas", 11, QFont::Bold));
+
+            painter.drawText(20, 35, QString("Gas Particles : %1").arg(gas_count));
+            if (avg_temp > 50.0) painter.setPen(QColor(255, 100, 100));
+            else painter.setPen(QColor(100, 200, 255));
+            painter.drawText(20, 60, QString("Avg Temp (T)  : %1 °C").arg(avg_temp, 0, 'f', 1));
+
+            painter.setPen(Qt::white);
+            painter.drawText(20, 85, QString("Cloud Vol (V) : %1 m³").arg(volume / 1000.0, 0, 'f', 2));
+
+            if (pressure > 200.0) painter.setPen(QColor(255, 150, 50));
+            painter.drawText(20, 110, QString("Pressure (P)  : %1 kPa").arg(pressure, 0, 'f', 1));
+        }
+        if (ice_count > 0){
+            painter.setPen(QColor(100, 200, 255));
+        } else {
+            painter.setPen(Qt::white);
+        }
+        painter.drawText(20, 135, QString("Ice Particles : %1").arg(ice_count));
     }
 
 private:
@@ -504,38 +646,54 @@ private:
             auto obj = spawn_at(x, y, ShapeType::CIRCLE, 20);
             obj->is_motor = true; obj->angular_velocity = 0.5; obj->color = QColor(255, 80, 80);
         } else if (active_tool == ObjectType::ROPE) {
-                    std::vector<PhysicsObject*> nodes;
-                    for (int i = 0; i < 12; ++i) {
-                        auto node = spawn_at(x, y + (i * 15), ShapeType::CIRCLE, 6, 1.0);
-
-                        // --- ADD THESE TWO LINES ---
-                        node->elasticity = 0.0;     // Dead drop, no bounce
-                        node->is_bouncy = false;    // Ignore the global slider
-                        // ---------------------------
-
-                        if (i == 0) { node->is_static = true; node->color = QColor(200, 200, 200); }
-                        nodes.push_back(node);
-                    }
-                    for (size_t i = 0; i < nodes.size() - 1; ++i) {
-                        rigid_links.emplace_back(nodes[i], nodes[i+1], 15.0);
-                    }
+            std::vector<PhysicsObject*> nodes;
+            for (int i = 0; i < 12; ++i) {
+                auto node = spawn_at(x, y + (i * 15), ShapeType::CIRCLE, 6, 1.0);
+                node->elasticity = 0.0;
+                node->is_bouncy = false;
+                if (i == 0) { node->is_static = true; node->color = QColor(200, 200, 200); }
+                nodes.push_back(node);
+            }
+            for (size_t i = 0; i < nodes.size() - 1; ++i) {
+                rigid_links.emplace_back(nodes[i], nodes[i+1], 15.0);
+            }
         } else if (active_tool == ObjectType::WATER) {
-            for (int i = 0; i < 30; ++i) {
-                for (int j = 0; j < 30; ++j) {
-                    auto node = spawn_at(x + i*10, y + j*10, ShapeType::CIRCLE, 0.6, 0.1, false, true);
-                    node->is_bouncy = false; // Add this to keep water from bouncing
+            for (int i = 0; i < 15; ++i) {
+                for (int j = 0; j < 15; ++j) {
+                    auto node = spawn_at(x + i*8, y + j*8, ShapeType::CIRCLE, 6.0, 1.0, false, true);
+                    node->is_bouncy = false;
                 }
             }
         } else if (active_tool == ObjectType::GAS) {
-            // Spawn a burst of gas particles
             for (int i = 0; i < 400; ++i) {
-                auto node = spawn_at(x + random_double(-15, 15), y + random_double(-15, 15), ShapeType::CIRCLE, 6.0, 0.5);
+                auto node = spawn_at(x + random_double(-15, 15), y + random_double(-15, 15), ShapeType::CIRCLE, 0.6, 0.5);
                 node->is_gas = true;
-                node->is_bouncy = true;
                 node->color = QColor(150, 255, 100, 150);
             }
+        } else if (active_tool == ObjectType::HEATER) {
+            auto obj = spawn_at(x, y, ShapeType::SQUARE, 25, -1, true);
+            obj->is_heater = true;
+            obj->temperature = 300.0;
+            obj->color = QColor(255, 60, 60);
+        } else if (active_tool == ObjectType::COOLER) {
+            auto obj = spawn_at(x, y, ShapeType::SQUARE, 25, -1, true);
+            obj->is_cooler = true;
+            obj->temperature = -100.0;
+            obj->color = QColor(60, 200, 255);
+        } else if (active_tool == ObjectType::CONTAINER) {
+            for (int i = -5; i <= 5; ++i) {
+                auto obj = spawn_at(x + i*20, y + 80, ShapeType::SQUARE, 10, -1, true);
+                obj->color = QColor(100, 110, 120);
+            }
+            for (int i = -4; i <= 3; ++i) {
+                auto obj = spawn_at(x - 110, y + i*20, ShapeType::SQUARE, 10, -1, true);
+                obj->color = QColor(100, 110, 120);
+            }
+            for (int i = -4; i <= 3; ++i) {
+                auto obj = spawn_at(x + 110, y + i*20, ShapeType::SQUARE, 10, -1, true);
+                obj->color = QColor(100, 110, 120);
+            }
         } else if (active_tool == ObjectType::BOMB) {
-            // Spawn a heavy, dark grey bomb with a 120-frame fuse (~2 seconds)
             auto obj = spawn_at(x, y, ShapeType::CIRCLE, 15, 10.0);
             obj->color = QColor(30, 30, 30);
             obj->fuse = 120;
@@ -582,7 +740,6 @@ private:
         sorted_balls.reserve(balls.size());
         for (auto& b : balls) sorted_balls.push_back(b.get());
 
-        // Fast 1D Spatial Sort (Sweep and Prune)
         std::sort(sorted_balls.begin(), sorted_balls.end(), [](PhysicsObject* a, PhysicsObject* b) {
             return a->position.x < b->position.x;
         });
@@ -599,7 +756,15 @@ private:
                 Vector delta_pos = b1->position - b2->position;
                 double distance = delta_pos.length();
 
-                // FLUID SPH LOGIC
+                // Heat Transfer
+                if (distance > 0 && distance < (b1->radius + b2->radius + 15.0)) {
+                    double heat_diff = b1->temperature - b2->temperature;
+                    double transfer_rate = 0.02;
+                    if (!b1->is_heater && !b1->is_cooler) b1->temperature -= heat_diff * transfer_rate;
+                    if (!b2->is_heater && !b2->is_cooler) b2->temperature += heat_diff * transfer_rate;
+                }
+
+                // Fluids
                 if (b1->is_fluid && b2->is_fluid) {
                     double smoothing_radius = b1->radius * 2.5;
                     if (distance > 0 && distance < smoothing_radius) {
@@ -626,7 +791,7 @@ private:
                         }
                     }
                 }
-                // SOLID RIGID BODY LOGIC
+                // Solids
                 else {
                     double min_distance = b1->radius + b2->radius;
                     if (distance > 0 && distance < min_distance) {
@@ -641,7 +806,7 @@ private:
                             b2->position -= normal * (overlap * (b1->mass / total_mass));
                         }
 
-                        double restitution = (b1->is_fluid || b2->is_fluid) ? 0.0 : std::min(b1->elasticity, b2->elasticity);
+                        double restitution = (b1->is_fluid || b2->is_fluid || b1->is_gas || b2->is_gas) ? 0.0 : std::min(b1->elasticity, b2->elasticity);
                         Vector delta_vel = b1->velocity - b2->velocity;
                         double vel_along_normal = delta_vel.dot(normal);
 
@@ -659,66 +824,63 @@ private:
             }
         }
     }
+
     void detonate_bomb(PhysicsObject* bomb) {
-            double blast_radius = 250.0; // How far the shockwave reaches
-            double max_force = 1500.0;   // The power of the shockwave
+        double blast_radius = 250.0;
+        double max_force = 1500.0;
 
-            for (auto& obj_ptr : balls) {
-                PhysicsObject* target = obj_ptr.get();
-                if (target == bomb || target->is_static) continue;
+        for (auto& obj_ptr : balls) {
+            PhysicsObject* target = obj_ptr.get();
+            if (target == bomb || target->is_static) continue;
 
-                Vector delta = target->position - bomb->position;
-                double distance = delta.length();
+            Vector delta = target->position - bomb->position;
+            double distance = delta.length();
 
-                // If the object is inside the blast radius
-                if (distance > 0 && distance < blast_radius) {
-                    // Calculate falloff: 1.0 at the center, 0.0 at the edge of the radius
-                    double falloff = 1.0 - (distance / blast_radius);
-
-                    // Direction of the push
-                    Vector push_dir = delta * (1.0 / distance);
-
-                    // Apply the force (square the falloff so it's more powerful at the center)
-                    double applied_force = max_force * (falloff * falloff);
-
-                    // Send the object flying! (Lighter objects fly faster)
-                    target->velocity += push_dir * (applied_force / target->mass);
-                }
+            if (distance > 0 && distance < blast_radius) {
+                double falloff = 1.0 - (distance / blast_radius);
+                Vector push_dir = delta * (1.0 / distance);
+                double applied_force = max_force * (falloff * falloff);
+                target->velocity += push_dir * (applied_force / target->mass);
             }
         }
+    }
 
-        void game_loop() {
-                if (!is_paused) {
-                    for (auto& s : springs) s.update();
-                    for (auto& p : pulleys) p.update();
-                    for (int i = 0; i < 4; ++i) {
-                        for (auto& l : rigid_links) l.update();
-                    }
-                    std::vector<PhysicsObject*> to_delete;
-                    for (auto& b : balls) {
-                        b->update(gravity, air_resistance, width(), height());
-
-                        if (b->fuse > 0) {
-                            b->fuse--;
-                            if (b->fuse % 10 < 5) b->color = QColor(255, 255, 255);
-                            else b->color = QColor(30, 30, 30);
-
-                            if (b->fuse == 0) {
-                                detonate_bomb(b.get());
-                                to_delete.push_back(b.get()); // Mark for removal
-                            }
-                        }
-                    }
-                    for (auto* bomb : to_delete) {
-                        remove_object(bomb);
-                    }
-                    // ---------------------------------
-
-                    resolve_collisions();
-                }
-                update();
+    void game_loop() {
+        if (!is_paused) {
+            for (auto& s : springs) s.update();
+            for (auto& p : pulleys) p.update();
+            for (auto& l : pistons) l.update();
+            for (int i = 0; i < 4; ++i) {
+                for (auto& l : rigid_links) l.update();
             }
+
+            std::vector<PhysicsObject*> to_delete;
+            for (auto& b : balls) {
+                b->update(gravity, air_resistance, width(), height());
+
+                if (b->fuse > 0) {
+                    b->fuse--;
+                    if (b->fuse == 0) {
+                        detonate_bomb(b.get());
+                        to_delete.push_back(b.get());
+                    }
+                }
+            }
+
+            for (auto* bomb : to_delete) {
+                remove_object(bomb);
+            }
+
+            resolve_collisions();
+        }
+        update();
+    }
 };
+
+// ==========================================
+// MAIN WINDOW
+// ==========================================
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
@@ -730,13 +892,12 @@ public:
 
     MainWindow() {
         setWindowTitle("Sapphire");
-        resize(1000, 800);
+        resize(1200, 900);
         setStyleSheet("background-color: #282c34;");
 
         stack = new QStackedWidget(this);
         setCentralWidget(stack);
 
-        // Intro Page
         QWidget* intro_page = new QWidget();
         QVBoxLayout* intro_layout = new QVBoxLayout(intro_page);
         intro_layout->setAlignment(Qt::AlignCenter);
@@ -774,26 +935,29 @@ private slots:
         sandbox_layout->setContentsMargins(0,0,0,0);
         sandbox_layout->setSpacing(0);
 
-        // Toolbox
         QWidget* toolbox = new QWidget();
-        toolbox->setFixedWidth(160);
+        toolbox->setFixedWidth(180);
         toolbox->setStyleSheet("background-color: #21252b; border-right: 1px solid #333;");
         QVBoxLayout* tb_layout = new QVBoxLayout(toolbox);
 
-        QLabel* l1 = new QLabel("<b style='color:#abb2bf; font-size:14px'>TOOLS</b>");
+        QLabel* l1 = new QLabel("<b style='color:#abb2bf; font-size:14px'>SPAWN TOOLS</b>");
         tb_layout->addWidget(l1);
 
         std::vector<std::pair<QString, ObjectType>> tools = {
             {"Ball", ObjectType::BALL}, {"Box", ObjectType::BOX}, {"Pin (Static)", ObjectType::PIN},
-            {"Draw Shape", ObjectType::POLYGON}, {"Gas Cloud", ObjectType::GAS},{"Rope Chain", ObjectType::ROPE}, {"Water Drop", ObjectType::WATER},
-            {"Motor", ObjectType::MOTOR}, {"Wheel", ObjectType::WHEEL}, {"Car Chassis", ObjectType::CHASSIS},{"Shockwave Bomb", ObjectType::BOMB}
+            {"Draw Shape", ObjectType::POLYGON}, {"Gas Cloud", ObjectType::GAS},
+            {"Rope Chain", ObjectType::ROPE}, {"Water Drop", ObjectType::WATER},
+            {"Container", ObjectType::CONTAINER}, {"Heater", ObjectType::HEATER},
+            {"Cooler", ObjectType::COOLER}, {"Wheel", ObjectType::WHEEL},
+            {"Motor", ObjectType::MOTOR}, {"Car Chassis", ObjectType::CHASSIS},
+            {"Shockwave Bomb", ObjectType::BOMB}
         };
 
         for (auto& t : tools) {
             QPushButton* btn = new QPushButton(t.first);
             btn->setCheckable(true);
             btn->setStyleSheet(
-                "QPushButton { background-color: #3e4451; color: white; padding: 8px; border-radius: 4px; }"
+                "QPushButton { background-color: #3e4451; color: white; padding: 6px; border-radius: 4px; }"
                 "QPushButton:checked { background-color: #61afef; color: black; font-weight: bold; }"
             );
             ObjectType t_type = t.second;
@@ -805,11 +969,15 @@ private slots:
         QLabel* l2 = new QLabel("<b style='color:#abb2bf; font-size:14px; margin-top:15px'>LINK TOOLS</b>");
         tb_layout->addWidget(l2);
 
-        for (auto& t : std::vector<std::pair<QString, ObjectType>>{{"Bouncy Spring", ObjectType::SPRING}, {"Pulley", ObjectType::PULLEY}}) {
+        for (auto& t : std::vector<std::pair<QString, ObjectType>>{
+            {"Bouncy Spring", ObjectType::SPRING},
+            {"Pulley", ObjectType::PULLEY},
+            {"Piston", ObjectType::PISTON}
+        }) {
             QPushButton* btn = new QPushButton(t.first);
             btn->setCheckable(true);
             btn->setStyleSheet(
-                "QPushButton { background-color: #d19a66; color: black; padding: 8px; border-radius: 4px; }"
+                "QPushButton { background-color: #d19a66; color: black; padding: 6px; border-radius: 4px; }"
                 "QPushButton:checked { background-color: #e5c07b; font-weight: bold; }"
             );
             ObjectType t_type = t.second;
@@ -832,7 +1000,6 @@ private slots:
 
         sandbox_layout->addWidget(toolbox);
 
-        // Right side (Canvas + Controls)
         QWidget* right_container = new QWidget();
         QVBoxLayout* right_layout = new QVBoxLayout(right_container);
         right_layout->setContentsMargins(0,0,0,0);
@@ -890,62 +1057,50 @@ private slots:
     }
 
     void spawn_car() {
-            double cx = canvas->width() / 2.0;
-            double cy = canvas->height() / 2.0;
+        double cx = canvas->width() / 2.0;
+        double cy = canvas->height() / 2.0;
 
-            // 1. Create a 2-node rigid chassis (Front and Rear) for stability
-            // We use squares to simulate the body frame
-            auto chassis_rear = canvas->spawn_at(cx - 35, cy, ShapeType::SQUARE, 20, 6.0);
-            auto chassis_front = canvas->spawn_at(cx + 35, cy, ShapeType::SQUARE, 20, 6.0);
-            chassis_rear->color = QColor(100, 150, 255);
-            chassis_front->color = QColor(100, 150, 255);
+        auto chassis_rear = canvas->spawn_at(cx - 35, cy, ShapeType::SQUARE, 20, 6.0);
+        auto chassis_front = canvas->spawn_at(cx + 35, cy, ShapeType::SQUARE, 20, 6.0);
+        chassis_rear->color = QColor(100, 150, 255);
+        chassis_front->color = QColor(100, 150, 255);
 
-            // 2. Create the wheels
-            auto w_rear = canvas->spawn_at(cx - 45, cy + 45, ShapeType::CIRCLE, 16, 3.0);
-            auto w_front = canvas->spawn_at(cx + 45, cy + 45, ShapeType::CIRCLE, 16, 3.0);
+        auto w_rear = canvas->spawn_at(cx - 45, cy + 45, ShapeType::CIRCLE, 16, 3.0);
+        auto w_front = canvas->spawn_at(cx + 45, cy + 45, ShapeType::CIRCLE, 16, 3.0);
 
-            // Make the rear wheel a motor and paint it red
-            w_rear->is_motor = true;
-            w_rear->angular_velocity = 1.2; // Slightly higher torque to move the robust frame
-            w_rear->color = QColor(255, 50, 50);
+        w_rear->is_motor = true;
+        w_rear->angular_velocity = 1.2;
+        w_rear->color = QColor(255, 50, 50);
+        w_front->color = QColor(50, 50, 50);
 
-            // Paint front wheel dark grey
-            w_front->color = QColor(50, 50, 50);
+        double body_len = (chassis_rear->position - chassis_front->position).length();
+        canvas->rigid_links.emplace_back(chassis_rear, chassis_front, body_len);
 
-            // 3. Lock the chassis nodes together so the car body cannot bend
-            double body_len = (chassis_rear->position - chassis_front->position).length();
-            canvas->rigid_links.emplace_back(chassis_rear, chassis_front, body_len);
-
-            // Helper lambda to auto-calculate spring rest-lengths based on spawn positions
-            auto add_strut = [&](PhysicsObject* a, PhysicsObject* b, double stiffness) {
-                double dist = (a->position - b->position).length();
-                canvas->springs.emplace_back(a, b, dist, stiffness);
-            };
-
-            // 4. Vertical Suspension (Shocks)
-            add_strut(chassis_rear, w_rear, 0.6);
-            add_strut(chassis_front, w_front, 0.6);
-
-            // 5. Cross-bracing (Keeps the chassis upright and prevents the parallelogram effect)
-            add_strut(chassis_rear, w_front, 0.3);
-            add_strut(chassis_front, w_rear, 0.3);
-
-            // 6. Wheelbase strut (Prevents the motor from just pushing the rear wheel under the car)
-            add_strut(w_rear, w_front, 0.5);
-        }
-        void update_physics_params() {
-                canvas->gravity.y = grav_slider->value() / 100.0;
-                canvas->air_resistance = wind_slider->value() / 1000.0;
-                canvas->elasticity = elas_slider->value() / 100.0;
-
-                for (auto& ball : canvas->balls) {
-                    // ONLY update objects that are meant to be bouncy
-                    if (ball->is_bouncy) {
-                        ball->elasticity = canvas->elasticity;
-                    }
-                }
-        }
+        auto add_strut = [&](PhysicsObject* a, PhysicsObject* b, double stiffness) {
+            double dist = (a->position - b->position).length();
+            canvas->springs.emplace_back(a, b, dist, stiffness);
         };
+
+        add_strut(chassis_rear, w_rear, 0.6);
+        add_strut(chassis_front, w_front, 0.6);
+        add_strut(chassis_rear, w_front, 0.3);
+        add_strut(chassis_front, w_rear, 0.3);
+        add_strut(w_rear, w_front, 0.5);
+    }
+
+    void update_physics_params() {
+        canvas->gravity.y = grav_slider->value() / 100.0;
+        canvas->air_resistance = wind_slider->value() / 1000.0;
+        canvas->elasticity = elas_slider->value() / 100.0;
+
+        for (auto& ball : canvas->balls) {
+            if (ball->is_bouncy) {
+                ball->elasticity = canvas->elasticity;
+            }
+        }
+    }
+};
+
 #include "main.moc"
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
