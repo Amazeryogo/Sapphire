@@ -6,6 +6,7 @@
 #include <QMouseEvent>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QPushButton>
 #include <QLabel>
 #include <QSlider>
@@ -111,7 +112,48 @@ public:
         if (!is_static) acceleration += force;
     }
 
-    void update(const Vector& gravity, double air_resistance, double bounds_width, double bounds_height) {
+    void update(const Vector& gravity, double air_resistance, double bounds_width, double bounds_height, double ambient_temp) {
+        // --- THERMODYNAMICS (KTG Improved) ---
+        if (!is_heater && !is_cooler) {
+            temperature += (ambient_temp - temperature) * 0.002; // Ambient natural cooling/heating
+        }
+
+        if (is_heater) temperature = 300.0;
+        if (is_cooler) temperature = -100.0;
+
+        // Phase changes
+        if (is_fluid && temperature > 100.0) {
+            is_fluid = false; is_gas = true;
+            is_bouncy = false;
+            color = QColor(200, 200, 200, 150); // Steam
+            is_steam = true;
+            velocity.x += random_double(-5.0, 5.0);
+            velocity.y += random_double(-5.0, -2.0); // pop upward
+        }
+        if (is_gas && temperature < 80.0 && is_steam) {
+            is_gas = false; is_fluid = true;
+            is_bouncy = false;
+            color = QColor(60, 150, 255, 200); // Water
+            is_steam = false;
+            velocity = velocity * 0.2; // condense and lose kinetic energy
+        }
+        if (is_fluid && temperature < 0.0) {
+            is_fluid = false; is_ice = true;
+            is_static = true;  // Ice becomes completely solid/static
+            is_bouncy = false;
+            elasticity = 0.0;  // Zero bounce
+            color = QColor(150, 240, 255, 200); // Ice
+        }
+        if (is_ice && temperature > 5.0) {
+            is_fluid = true; is_ice = false;
+            is_static = false; // Melts into dynamic water
+            is_bouncy = false;
+            elasticity = 0.1;
+            color = QColor(60, 150, 255, 200); // Water
+        }
+
+        // Return early for static objects AFTER applying phase changes and thermodynamics
+        // This ensures static Ice can still naturally melt over time
         if (is_static) {
             velocity = Vector(0,0,0);
             return;
@@ -125,47 +167,24 @@ public:
 
         if (is_motor) velocity.x += angular_velocity;
 
-        // --- THERMODYNAMICS ---
-        temperature += (20.0 - temperature) * 0.005; // Ambient cooling
-        double speed = velocity.length();
-        if (speed > 2.0) temperature += (speed * 0.05); // Kinetic heating
-
-        if (is_heater) temperature = 300.0;
-        if (is_cooler) temperature = -100.0;
-
-        // Phase changes
-        if (is_fluid && temperature > 100.0) {
-            is_fluid = false; is_gas = true;
-            color = QColor(200, 200, 200, 150); // Steam
-            is_steam = true;
-        }
-        if (is_gas && temperature < 80.0 && is_steam) {
-            is_gas = false; is_fluid = true;
-            color = QColor(60, 150, 255, 200); // Water
-            is_steam = false;
-        }
-        if (is_fluid && temperature < 0.0) {
-            is_fluid = false; is_gas = true;
-            color = QColor(150, 255, 100, 150); // Ice
-            is_ice = true;
-        }
-        if (is_gas && temperature > 0.0 && is_ice) {
-            is_gas = false; is_fluid = true;
-            color = QColor(60, 150, 255, 200); // Water
-            is_ice = false;
-        }
-
-
+        // Apply Forces and Brownian Motion based on KTG
         if (is_gas) {
-            double lift = std::max(0.2, (temperature / 100.0));
-            velocity.x += random_double(-0.2, 0.2);
+            // Particles move randomly with speed proportional to sqrt(Temperature)
+            double thermal_speed = std::sqrt(std::max(1.0, temperature + 273.15)) * 0.02;
+            velocity.x += random_double(-thermal_speed, thermal_speed);
+            velocity.y += random_double(-thermal_speed, thermal_speed);
+
+            // Buoyancy: Hot gas rises, overcoming gravity
+            double buoyancy = gravity.y * (1.0 + std::max(0.0, (temperature - 20.0) / 100.0));
+            velocity.y -= buoyancy; // Apply upward buoyant force
         } else {
             apply_force(gravity);
         }
 
         velocity += acceleration;
 
-        double safe_drag = std::max(0.0, std::min(air_resistance, 0.99));
+        // Gases have much lower macro drag to allow free expansion
+        double safe_drag = is_gas ? std::min(air_resistance * 0.05, 0.99) : std::min(air_resistance, 0.99);
         velocity = velocity * (1.0 - safe_drag);
 
         double max_speed = 150.0;
@@ -177,7 +196,7 @@ public:
         acceleration = Vector(0, 0, 0);
 
         handle_wall_collisions(bounds_width, bounds_height);
-        if (!is_fluid && !is_gas) update_trail();
+        if (!is_fluid && !is_gas && !is_ice) update_trail();
     }
 
     void update_trail() {
@@ -308,28 +327,20 @@ public:
         phase += speed;
         double target_length = min_len + (max_len - min_len) * (std::sin(phase) + 1.0) / 2.0;
 
-        Vector delta = obj_b->position - obj_a->position;
+        Vector delta = obj_a->position - obj_b->position;
         double dist = delta.length();
         if (dist == 0) return;
 
-        double error = dist - target_length;
-        Vector direction = delta * (1.0 / dist);
+        double force_mag = (dist - target_length) * 0.8;
+        Vector force_dir = delta * (1.0 / dist);
+        Vector rel_vel = obj_a->velocity - obj_b->velocity;
+        Vector damping_force = force_dir * (rel_vel.dot(force_dir) * 0.2);
+        Vector total_force = (force_dir * force_mag) + damping_force;
 
-        double inv_mass_a = obj_a->is_static ? 0 : 1.0 / obj_a->mass;
-        double inv_mass_b = obj_b->is_static ? 0 : 1.0 / obj_b->mass;
-        double sum_mass = inv_mass_a + inv_mass_b;
-        if (sum_mass == 0) return;
-
-        double correction = error / sum_mass;
-
-        if (!obj_a->is_static) obj_a->position += direction * (correction * inv_mass_a);
-        if (!obj_b->is_static) obj_b->position -= direction * (correction * inv_mass_b);
+        if (!obj_a->is_static) obj_a->apply_force(total_force * -1.0);
+        if (!obj_b->is_static) obj_b->apply_force(total_force);
     }
 };
-
-// ==========================================
-// PHYSICS CANVAS
-// ==========================================
 
 class PhysicsCanvas : public QWidget {
     Q_OBJECT
@@ -337,6 +348,9 @@ public:
     Vector gravity = Vector(0.0, 0.3, 0.0);
     double air_resistance = 0.01;
     double elasticity = 0.8;
+    double ambient_temperature = 20.0;
+    double heat_transfer_rate = 0.05;
+    double fluid_viscosity = 0.05;
 
     std::vector<std::shared_ptr<PhysicsObject>> balls;
     std::vector<Spring> springs;
@@ -388,7 +402,11 @@ public:
     PhysicsObject* spawn_at(double x, double y, ShapeType shape, double radius=18.0, double mass=-1.0,
                             bool is_static=false, bool is_fluid=false) {
         auto obj = std::make_shared<PhysicsObject>(x, y, radius, elasticity, mass, QColor(), shape, is_static, is_fluid);
-        if (is_fluid) obj->elasticity = 0.1;
+        if (is_fluid) {
+            obj->elasticity = 0.1;
+            obj->is_bouncy = false;
+        }
+        obj->temperature = ambient_temperature;
         balls.push_back(obj);
         return obj.get();
     }
@@ -482,7 +500,7 @@ protected:
 
                         } else if (active_tool == ObjectType::PISTON) {
                             double dist = (connection_start_obj->position - target_ball->position).length();
-                            pistons.emplace_back(connection_start_obj, target_ball, dist * 0.5, dist * 1.5, 0.05);
+                            pistons.emplace_back(connection_start_obj, target_ball, dist * 0.7, dist * 1.5, 0.05);
 
                         } else if (active_tool == ObjectType::PULLEY) {
                             double anchor_x = (connection_start_obj->position.x + target_ball->position.x) / 2.0;
@@ -550,7 +568,7 @@ protected:
             PhysicsObject* obj = obj_ptr.get();
             if (!is_valid(obj->position) || !is_valid(obj->radius)) continue;
 
-            if (obj->trail.size() > 2 && !obj->is_static && !obj->is_fluid && !obj->is_gas) {
+            if (obj->trail.size() > 2 && !obj->is_static && !obj->is_fluid && !obj->is_gas && !obj->is_ice) {
                 QPen t_pen(obj->color);
                 for (size_t i = 1; i < obj->trail.size(); ++i) {
                     int opacity = int(255 * (float(i) / obj->trail.size()));
@@ -594,7 +612,10 @@ protected:
                 if (obj_ptr->position.y < min_y) min_y = obj_ptr->position.y;
                 if (obj_ptr->position.y > max_y) max_y = obj_ptr->position.y;
             }
-            if (obj_ptr->is_ice) ice_count++;
+            if (obj_ptr->is_ice) {
+                ice_count++;
+                total_temp += obj_ptr->temperature;
+            }
         }
 
         if (gas_count > 0) {
@@ -602,7 +623,11 @@ protected:
             double width_bb = std::max(10.0, max_x - min_x);
             double height_bb = std::max(10.0, max_y - min_y);
             double volume = width_bb * height_bb;
-            double pressure = (gas_count * std::max(1.0, avg_temp) * 5000.0) / volume;
+
+            // Ideal Gas Law P = nRT/V
+            double r_const = 8.314;
+            double temp_k = avg_temp + 273.15;
+            double pressure = (gas_count * r_const * temp_k * 50.0) / volume;
 
             painter.setPen(QPen(QColor(150, 255, 100, 80), 2, Qt::DashLine));
             painter.setBrush(Qt::NoBrush);
@@ -626,12 +651,31 @@ protected:
             if (pressure > 200.0) painter.setPen(QColor(255, 150, 50));
             painter.drawText(20, 110, QString("Pressure (P)  : %1 kPa").arg(pressure, 0, 'f', 1));
         }
+
         if (ice_count > 0){
-            painter.setPen(QColor(100, 200, 255));
-        } else {
-            painter.setPen(Qt::white);
+            if (gas_count == 0) {
+                painter.setBrush(QColor(20, 22, 28, 220));
+                painter.setPen(QPen(QColor(100, 150, 255), 1));
+                painter.drawRoundedRect(10, 10, 200, 40, 8, 8);
+                painter.setFont(QFont("Consolas", 11, QFont::Bold));
+            } else {
+                painter.drawText(20, 60, QString("Avg Temp (T)  : %1 °C").arg(total_temp / ice_count, 0, 'f', 1));
+            }
+            painter.setPen(QColor(100, 240, 255));
+            painter.drawText(20, gas_count > 0 ? 135 : 35, QString("Ice Particles : %1").arg(ice_count));
         }
-        painter.drawText(20, 135, QString("Ice Particles : %1").arg(ice_count));
+
+        // Permanent Ambient Temperature Display
+        painter.setBrush(QColor(20, 22, 28, 220));
+        painter.setPen(QPen(QColor(100, 150, 255), 1));
+        painter.drawRoundedRect(10, height() - 40, 220, 30, 8, 8);
+
+        if (ambient_temperature > 50.0) painter.setPen(QColor(255, 100, 100));
+        else if (ambient_temperature < 0.0) painter.setPen(QColor(100, 240, 255));
+        else painter.setPen(Qt::white);
+
+        painter.setFont(QFont("Consolas", 11, QFont::Bold));
+        painter.drawText(20, height() - 20, QString("Ambient Temp : %1 °C").arg(ambient_temperature, 0, 'f', 1));
     }
 
 private:
@@ -666,8 +710,9 @@ private:
             }
         } else if (active_tool == ObjectType::GAS) {
             for (int i = 0; i < 400; ++i) {
-                auto node = spawn_at(x + random_double(-15, 15), y + random_double(-15, 15), ShapeType::CIRCLE, 0.6, 0.5);
+                auto node = spawn_at(x + random_double(-15, 15), y + random_double(-15, 15), ShapeType::CIRCLE, 1.5, 0.5);
                 node->is_gas = true;
+                node->is_bouncy = false;
                 node->color = QColor(150, 255, 100, 150);
             }
         } else if (active_tool == ObjectType::HEATER) {
@@ -681,16 +726,17 @@ private:
             obj->temperature = -100.0;
             obj->color = QColor(60, 200, 255);
         } else if (active_tool == ObjectType::CONTAINER) {
-            for (int i = -5; i <= 5; ++i) {
-                auto obj = spawn_at(x + i*20, y + 80, ShapeType::SQUARE, 10, -1, true);
+            // Overlapping squares by 2 units (radius=10 -> width=20, spacing=18) to create an airtight seal
+            for (int i = -6; i <= 6; ++i) {
+                auto obj = spawn_at(x + i*18, y + 90, ShapeType::SQUARE, 10, -1, true);
                 obj->color = QColor(100, 110, 120);
             }
-            for (int i = -4; i <= 3; ++i) {
-                auto obj = spawn_at(x - 110, y + i*20, ShapeType::SQUARE, 10, -1, true);
+            for (int i = -4; i <= 4; ++i) {
+                auto obj = spawn_at(x - 108, y + i*18, ShapeType::SQUARE, 10, -1, true);
                 obj->color = QColor(100, 110, 120);
             }
-            for (int i = -4; i <= 3; ++i) {
-                auto obj = spawn_at(x + 110, y + i*20, ShapeType::SQUARE, 10, -1, true);
+            for (int i = -4; i <= 4; ++i) {
+                auto obj = spawn_at(x + 108, y + i*18, ShapeType::SQUARE, 10, -1, true);
                 obj->color = QColor(100, 110, 120);
             }
         } else if (active_tool == ObjectType::BOMB) {
@@ -751,18 +797,19 @@ private:
                 PhysicsObject* b2 = sorted_balls[j];
 
                 if ((b2->position.x - b1->position.x) > (b1->radius + b2->radius + 20.0)) break;
-                if (b1->is_static && b2->is_static) continue;
 
                 Vector delta_pos = b1->position - b2->position;
                 double distance = delta_pos.length();
 
-                // Heat Transfer
+                // Heat Transfer on Proximity/Collision (moved above static check so static ice can melt on static heaters)
                 if (distance > 0 && distance < (b1->radius + b2->radius + 15.0)) {
                     double heat_diff = b1->temperature - b2->temperature;
-                    double transfer_rate = 0.02;
-                    if (!b1->is_heater && !b1->is_cooler) b1->temperature -= heat_diff * transfer_rate;
-                    if (!b2->is_heater && !b2->is_cooler) b2->temperature += heat_diff * transfer_rate;
+                    double q = heat_diff * heat_transfer_rate;
+                    if (!b1->is_heater && !b1->is_cooler) b1->temperature -= q;
+                    if (!b2->is_heater && !b2->is_cooler) b2->temperature += q;
                 }
+
+                if (b1->is_static && b2->is_static) continue;
 
                 // Fluids
                 if (b1->is_fluid && b2->is_fluid) {
@@ -772,7 +819,7 @@ private:
                         Vector normal = delta_pos * (1.0 / distance);
 
                         double pressure = (q * q) * 2.0;
-                        double viscosity = 0.05;
+                        double viscosity = fluid_viscosity;
 
                         Vector push = normal * pressure;
                         b1->velocity += push * (1.0 / b1->mass);
@@ -791,7 +838,7 @@ private:
                         }
                     }
                 }
-                // Solids
+                // Solids and Gases
                 else {
                     double min_distance = b1->radius + b2->radius;
                     if (distance > 0 && distance < min_distance) {
@@ -806,7 +853,18 @@ private:
                             b2->position -= normal * (overlap * (b1->mass / total_mass));
                         }
 
-                        double restitution = (b1->is_fluid || b2->is_fluid || b1->is_gas || b2->is_gas) ? 0.0 : std::min(b1->elasticity, b2->elasticity);
+                        // Determine Restitution based on state
+                        double restitution;
+                        if (b1->is_gas && b2->is_gas) {
+                            restitution = 1.0; // Perfectly elastic collisions for Ideal Gases
+                        } else if (b1->is_fluid || b2->is_fluid) {
+                            restitution = 0.1; // Fluids absorb impact
+                        } else if (b1->is_gas || b2->is_gas) {
+                            restitution = 0.5; // Gas hitting solid
+                        } else {
+                            restitution = std::min(b1->elasticity, b2->elasticity);
+                        }
+
                         Vector delta_vel = b1->velocity - b2->velocity;
                         double vel_along_normal = delta_vel.dot(normal);
 
@@ -856,7 +914,7 @@ private:
 
             std::vector<PhysicsObject*> to_delete;
             for (auto& b : balls) {
-                b->update(gravity, air_resistance, width(), height());
+                b->update(gravity, air_resistance, width(), height(), ambient_temperature);
 
                 if (b->fuse > 0) {
                     b->fuse--;
@@ -889,6 +947,7 @@ public:
     std::vector<std::pair<QPushButton*, ObjectType>> tool_buttons;
     QPushButton* pause_btn;
     QSlider *grav_slider, *elas_slider, *wind_slider;
+    QSlider *temp_slider, *heat_slider, *visc_slider;
 
     MainWindow() {
         setWindowTitle("Sapphire");
@@ -1009,23 +1068,29 @@ private slots:
         right_layout->addWidget(canvas);
 
         QWidget* controls = new QWidget();
-        controls->setStyleSheet("background-color: #1e1e24; color: white; border-top: 1px solid #333;");
-        QHBoxLayout* ctrl_layout = new QHBoxLayout(controls);
+        controls->setStyleSheet("background-color: #1e1e24; color: white; border-top: 1px solid #333; padding: 10px;");
+        QGridLayout* ctrl_layout = new QGridLayout(controls);
 
-        auto add_slider = [&](const QString& name, QSlider*& slider_ptr, int min_v, int max_v, int def_v) {
+        auto add_slider = [&](const QString& name, QSlider*& slider_ptr, int min_v, int max_v, int def_v, int row, int col) {
             QVBoxLayout* l = new QVBoxLayout();
-            l->addWidget(new QLabel(name));
+            QLabel* lbl = new QLabel(name);
+            lbl->setAlignment(Qt::AlignCenter);
+            l->addWidget(lbl);
             slider_ptr = new QSlider(Qt::Horizontal);
             slider_ptr->setRange(min_v, max_v);
             slider_ptr->setValue(def_v);
             connect(slider_ptr, &QSlider::valueChanged, this, &MainWindow::update_physics_params);
             l->addWidget(slider_ptr);
-            ctrl_layout->addLayout(l);
+            ctrl_layout->addLayout(l, row, col);
         };
 
-        add_slider("Gravity", grav_slider, 0, 100, 30);
-        add_slider("Bounciness", elas_slider, 10, 100, 80);
-        add_slider("Wind Drag", wind_slider, 0, 50, 10);
+        add_slider("Gravity", grav_slider, 0, 100, 30, 0, 0);
+        add_slider("Bounciness", elas_slider, 10, 100, 80, 0, 1);
+        add_slider("Wind Drag", wind_slider, 0, 50, 10, 0, 2);
+
+        add_slider("Ambient Temp (°C)", temp_slider, -100, 300, 20, 1, 0);
+        add_slider("Heat Transfer Rate", heat_slider, 0, 100, 5, 1, 1);
+        add_slider("Fluid Viscosity", visc_slider, 0, 100, 5, 1, 2);
 
         right_layout->addWidget(controls);
         sandbox_layout->addWidget(right_container);
@@ -1092,6 +1157,10 @@ private slots:
         canvas->gravity.y = grav_slider->value() / 100.0;
         canvas->air_resistance = wind_slider->value() / 1000.0;
         canvas->elasticity = elas_slider->value() / 100.0;
+
+        canvas->ambient_temperature = temp_slider->value();
+        canvas->heat_transfer_rate = heat_slider->value() / 100.0;
+        canvas->fluid_viscosity = visc_slider->value() / 100.0;
 
         for (auto& ball : canvas->balls) {
             if (ball->is_bouncy) {
