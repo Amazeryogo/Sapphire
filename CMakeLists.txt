@@ -1,19 +1,65 @@
 cmake_minimum_required(VERSION 3.16)
-project(Sapphire VERSION 1.0 LANGUAGES CXX)
+project(Sapphire LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
-# Enable Qt's automatic build systems
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
+option(SAPPHIRE_BUILD_APP   "Build the Qt sandbox application" ON)
+option(SAPPHIRE_BUILD_TESTS "Build the physics-core tests"     ON)
 
-# Find Qt6 Widgets module
-find_package(Qt6 COMPONENTS Widgets REQUIRED)
+# ---- Physics core: plain C++17, no Qt ----
+add_library(sapphire_core STATIC
+    src/core/physics_object.cpp
+    src/core/constraints.cpp
+    src/core/spatial_hash.cpp
+    src/core/world.cpp
+    src/core/serialization.cpp
+)
+target_include_directories(sapphire_core PUBLIC src/core)
+if(MSVC)
+    target_compile_options(sapphire_core PRIVATE /W4)
+else()
+    target_compile_options(sapphire_core PRIVATE -Wall -Wextra)
+endif()
 
-# Compile the main file
-add_executable(Sapphire main.cpp)
+# ---- Qt application ----
+if(SAPPHIRE_BUILD_APP)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets)
+    add_library(sapphire_ui STATIC
+        src/app/physics_canvas.h
+        src/app/physics_canvas.cpp
+        src/app/main_window.h
+        src/app/main_window.cpp
+    )
+    target_include_directories(sapphire_ui PUBLIC src/app)
+    target_link_libraries(sapphire_ui PUBLIC sapphire_core Qt6::Widgets)
+    set_target_properties(sapphire_ui PROPERTIES AUTOMOC ON)
+    if(NOT MSVC)
+        target_compile_options(sapphire_ui PRIVATE -Wall -Wextra)
+    endif()
 
-# Link against Qt6
-target_link_libraries(Sapphire PRIVATE Qt6::Widgets)
+    add_executable(sapphire WIN32 src/app/main.cpp)
+    target_link_libraries(sapphire PRIVATE sapphire_ui)
+endif()
+
+# ---- Tests ----
+if(SAPPHIRE_BUILD_TESTS)
+    enable_testing()
+    add_executable(sapphire_tests tests/core_tests.cpp)
+    target_link_libraries(sapphire_tests PRIVATE sapphire_core)
+    add_test(NAME core COMMAND sapphire_tests)
+
+    # Headless end-to-end test of the window (needs Qt Test).
+    if(SAPPHIRE_BUILD_APP)
+        find_package(Qt6 QUIET COMPONENTS Test)
+        if(Qt6Test_FOUND)
+            add_executable(sapphire_ui_smoke tests/ui_smoke.cpp)
+            target_link_libraries(sapphire_ui_smoke PRIVATE sapphire_ui Qt6::Test)
+            add_test(NAME ui_smoke COMMAND sapphire_ui_smoke)
+            set_tests_properties(ui_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        endif()
+    endif()
+endif()
