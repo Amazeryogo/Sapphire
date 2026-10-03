@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <algorithm>
+#include <limits>
 
 enum class ShapeType { CIRCLE, SQUARE, TRIANGLE };
 enum class ObjectType { BALL, BOX, SPRING, PULLEY, WHEEL, MOTOR, CHASSIS, PIN, ROPE, WATER, GAS, POLYGON, HEATER, COOLER, BOMB, PISTON, CONTAINER };
@@ -83,6 +84,11 @@ public:
     bool is_cooler = false;
     bool is_steam = false;
     bool is_ice = false;
+    // Thermal quantities use intentionally scaled SI-like units so the simulation
+    // remains stable at the 60 Hz UI time step.
+    double heat_capacity = 1.0;
+    double latent_energy = 0.0;
+    bool is_container_piston = false;
     int fuse = -1;
 
     std::vector<QPointF> trail;
@@ -100,6 +106,7 @@ public:
         is_static = is_stat;
         is_fluid = is_fl;
         mass = (m < 0) ? (r * r) / 100.0 : m;
+        heat_capacity = std::max(0.25, mass * (is_fluid ? 4.18 : 0.9));
 
         if (is_fluid) {
             color = QColor(60, 150, 255, 200);
@@ -112,45 +119,107 @@ public:
         if (!is_static) acceleration += force;
     }
 
+    double thermal_mass() const { return std::max(0.25, heat_capacity); }
+
+    // Adds energy rather than directly assigning a temperature.  At a phase
+    // boundary the energy is stored as latent heat until the transition finishes.
+    void add_heat(double energy) {
+        if (is_heater || is_cooler || !is_valid(energy)) return;
+        constexpr double melt_point = 0.0;
+        constexpr double boil_point = 100.0;
+        const double fusion_heat = std::max(8.0, mass * 40.0);
+        const double vapor_heat = std::max(45.0, mass * 225.0);
+
+        if (is_ice) {
+            if (temperature < melt_point) {
+                double to_melt = (melt_point - temperature) * thermal_mass();
+                if (energy < to_melt) { temperature += energy / thermal_mass(); return; }
+                energy -= to_melt;
+                temperature = melt_point;
+            }
+            latent_energy += energy;
+            if (latent_energy >= fusion_heat) {
+                energy = latent_energy - fusion_heat;
+                latent_energy = 0.0;
+                is_ice = false; is_fluid = true; is_static = false;
+                elasticity = 0.08; is_bouncy = false;
+                color = QColor(60, 150, 255, 200);
+                add_heat(energy);
+            }
+            return;
+        }
+
+        if (is_gas) {
+            if (temperature > boil_point) {
+                temperature += energy / thermal_mass();
+                return;
+            }
+            // Condensation releases the stored vapor latent heat before cooling
+            // the liquid below its boiling point.
+            latent_energy += energy;
+            if (latent_energy <= -vapor_heat) {
+                energy = latent_energy + vapor_heat;
+                latent_energy = 0.0;
+                is_gas = false; is_fluid = true; is_steam = false;
+                color = QColor(60, 150, 255, 200);
+                temperature = boil_point;
+                add_heat(energy);
+            }
+            return;
+        }
+
+        // Liquid water: reverse a partially completed phase change before its
+        // temperature can move away from the phase boundary.
+        if (temperature <= melt_point && (energy < 0.0 || latent_energy < 0.0)) {
+            latent_energy += energy;
+            temperature = melt_point;
+            if (latent_energy <= -fusion_heat) {
+                energy = latent_energy + fusion_heat;
+                latent_energy = 0.0;
+                is_fluid = false; is_ice = true; is_static = true;
+                elasticity = 0.0; is_bouncy = false;
+                color = QColor(150, 240, 255, 200);
+                add_heat(energy);
+            } else if (latent_energy > 0.0) {
+                energy = latent_energy;
+                latent_energy = 0.0;
+                add_heat(energy);
+            }
+            return;
+        }
+        if (temperature >= boil_point && (energy > 0.0 || latent_energy > 0.0)) {
+            latent_energy += energy;
+            temperature = boil_point;
+            if (latent_energy >= vapor_heat) {
+                energy = latent_energy - vapor_heat;
+                latent_energy = 0.0;
+                is_fluid = false; is_gas = true; is_steam = true;
+                color = QColor(200, 200, 200, 150);
+                add_heat(energy);
+            } else if (latent_energy < 0.0) {
+                energy = latent_energy;
+                latent_energy = 0.0;
+                add_heat(energy);
+            }
+            return;
+        }
+
+        temperature += energy / thermal_mass();
+        if (temperature < melt_point) {
+            energy = (temperature - melt_point) * thermal_mass();
+            temperature = melt_point;
+            add_heat(energy);
+        } else if (temperature > boil_point) {
+            energy = (temperature - boil_point) * thermal_mass();
+            temperature = boil_point;
+            add_heat(energy);
+        }
+    }
+
     void update(const Vector& gravity, double air_resistance, double bounds_width, double bounds_height, double ambient_temp) {
-        // --- THERMODYNAMICS (KTG Improved) ---
-        if (!is_heater && !is_cooler) {
-            temperature += (ambient_temp - temperature) * 0.002; // Ambient natural cooling/heating
-        }
-
-        if (is_heater) temperature = 300.0;
-        if (is_cooler) temperature = -100.0;
-
-        // Phase changes
-        if (is_fluid && temperature > 100.0) {
-            is_fluid = false; is_gas = true;
-            is_bouncy = false;
-            color = QColor(200, 200, 200, 150); // Steam
-            is_steam = true;
-            velocity.x += random_double(-5.0, 5.0);
-            velocity.y += random_double(-5.0, -2.0); // pop upward
-        }
-        if (is_gas && temperature < 80.0 && is_steam) {
-            is_gas = false; is_fluid = true;
-            is_bouncy = false;
-            color = QColor(60, 150, 255, 200); // Water
-            is_steam = false;
-            velocity = velocity * 0.2; // condense and lose kinetic energy
-        }
-        if (is_fluid && temperature < 0.0) {
-            is_fluid = false; is_ice = true;
-            is_static = true;  // Ice becomes completely solid/static
-            is_bouncy = false;
-            elasticity = 0.0;  // Zero bounce
-            color = QColor(150, 240, 255, 200); // Ice
-        }
-        if (is_ice && temperature > 5.0) {
-            is_fluid = true; is_ice = false;
-            is_static = false; // Melts into dynamic water
-            is_bouncy = false;
-            elasticity = 0.1;
-            color = QColor(60, 150, 255, 200); // Water
-        }
+        // Heat is exchanged by PhysicsCanvas before integration.  Ambient is no
+        // longer a fixed thermostat; it is a finite thermal reservoir.
+        static_cast<void>(ambient_temp);
 
         // Return early for static objects AFTER applying phase changes and thermodynamics
         // This ensures static Ice can still naturally melt over time
@@ -169,8 +238,10 @@ public:
 
         // Apply Forces and Brownian Motion based on KTG
         if (is_gas) {
-            // Particles move randomly with speed proportional to sqrt(Temperature)
-            double thermal_speed = std::sqrt(std::max(1.0, temperature + 273.15)) * 0.02;
+            // Thermal agitation follows sqrt(T); the random component is small
+            // enough that wall impulses, rather than a display equation, produce
+            // the bulk pressure on containers and pistons.
+            double thermal_speed = std::sqrt(std::max(1.0, temperature + 273.15)) * 0.006;
             velocity.x += random_double(-thermal_speed, thermal_speed);
             velocity.y += random_double(-thermal_speed, thermal_speed);
 
@@ -317,29 +388,59 @@ public:
     PhysicsObject* obj_b;
     double min_len;
     double max_len;
-    double phase;
-    double speed;
+    double rest_length;
+    double damping;
 
     PistonLink(PhysicsObject* a, PhysicsObject* b, double min_l, double max_l, double s = 0.05)
-        : obj_a(a), obj_b(b), min_len(min_l), max_len(max_l), phase(0), speed(s) {}
+        : obj_a(a), obj_b(b), min_len(min_l), max_len(max_l),
+          rest_length((min_l + max_l) * 0.5), damping(std::max(0.05, s * 4.0)) {}
 
     void update() {
-        phase += speed;
-        double target_length = min_len + (max_len - min_len) * (std::sin(phase) + 1.0) / 2.0;
-
         Vector delta = obj_a->position - obj_b->position;
         double dist = delta.length();
         if (dist == 0) return;
 
-        double force_mag = (dist - target_length) * 0.8;
+        // A piston link is a cylinder with physical end-stops, not a sinusoidal
+        // distance constraint.  It can freely travel between its stops and only
+        // reacts when its rod bottoms out or reaches full extension.
+        double error = 0.0;
+        if (dist < min_len) error = dist - min_len;
+        else if (dist > max_len) error = dist - max_len;
+        else return;
         Vector force_dir = delta * (1.0 / dist);
         Vector rel_vel = obj_a->velocity - obj_b->velocity;
-        Vector damping_force = force_dir * (rel_vel.dot(force_dir) * 0.2);
-        Vector total_force = (force_dir * force_mag) + damping_force;
+        Vector total_force = force_dir * (error * 1.2 + rel_vel.dot(force_dir) * damping);
 
         if (!obj_a->is_static) obj_a->apply_force(total_force * -1.0);
         if (!obj_b->is_static) obj_b->apply_force(total_force);
     }
+};
+
+// A container has analytic walls, so gas cannot leak through gaps between
+// overlapping collision squares.  Its upper wall is a massive, vertically
+// guided piston that receives force from the gas in the sealed volume.
+class GasContainer {
+public:
+    double left, right, bottom;
+    double piston_min_y, piston_max_y;
+    PhysicsObject* piston = nullptr;
+    double pressure = 0.0;
+    double average_temperature = 20.0;
+    int gas_particles = 0;
+
+    GasContainer(double x, double y, double half_width = 110.0, double half_height = 90.0)
+        : left(x - half_width), right(x + half_width), bottom(y + half_height),
+          piston_min_y(y - half_height), piston_max_y(y + half_height - 35.0) {}
+
+    double top() const { return piston ? piston->position.y : piston_min_y; }
+    bool contains_horizontally(const PhysicsObject& object) const {
+        return object.position.x + object.radius > left && object.position.x - object.radius < right;
+    }
+    bool contains(const PhysicsObject& object) const {
+        return contains_horizontally(object) && object.position.y + object.radius > top()
+            && object.position.y - object.radius < bottom;
+    }
+    double volume() const { return std::max(600.0, (right - left) * (bottom - top())); }
 };
 
 class PhysicsCanvas : public QWidget {
@@ -349,6 +450,8 @@ public:
     double air_resistance = 0.01;
     double elasticity = 0.8;
     double ambient_temperature = 20.0;
+    double ambient_setpoint = 20.0; // Slow heat leak to the outside room.
+    double ambient_heat_capacity = 12000.0;
     double heat_transfer_rate = 0.05;
     double fluid_viscosity = 0.05;
 
@@ -357,6 +460,7 @@ public:
     std::vector<Pulley> pulleys;
     std::vector<RigidLink> rigid_links;
     std::vector<PistonLink> pistons;
+    std::vector<GasContainer> containers;
 
     PhysicsObject* dragged_ball = nullptr;
     QPointF last_mouse_pos;
@@ -375,7 +479,7 @@ public:
     }
 
     void restart(int num_balls) {
-        balls.clear(); springs.clear(); pulleys.clear(); rigid_links.clear(); pistons.clear();
+        balls.clear(); springs.clear(); pulleys.clear(); rigid_links.clear(); pistons.clear(); containers.clear();
         dragged_ball = nullptr; connection_start_obj = nullptr;
         update();
     }
@@ -395,6 +499,9 @@ public:
         pistons.erase(std::remove_if(pistons.begin(), pistons.end(),
             [obj](const PistonLink& p) { return p.obj_a == obj || p.obj_b == obj; }), pistons.end());
 
+        containers.erase(std::remove_if(containers.begin(), containers.end(),
+            [obj](const GasContainer& c) { return c.piston == obj; }), containers.end());
+
         balls.erase(std::remove_if(balls.begin(), balls.end(),
             [obj](const std::shared_ptr<PhysicsObject>& b) { return b.get() == obj; }), balls.end());
     }
@@ -409,6 +516,18 @@ public:
         obj->temperature = ambient_temperature;
         balls.push_back(obj);
         return obj.get();
+    }
+
+    void spawn_container(double x, double y) {
+        containers.emplace_back(x, y);
+        GasContainer& container = containers.back();
+        PhysicsObject* face = spawn_at(x, container.piston_min_y, ShapeType::SQUARE, 8.0, 80.0);
+        face->is_container_piston = true;
+        face->is_bouncy = false;
+        face->elasticity = 0.05;
+        face->color = QColor(255, 140, 50);
+        face->velocity = Vector(0, 0, 0);
+        container.piston = face;
     }
 
 protected:
@@ -559,6 +678,22 @@ protected:
                 painter.drawLine(l.obj_a->position.to_qpointf(), l.obj_b->position.to_qpointf());
         }
 
+        // Draw sealed analytic walls and the guided moving face.  They are not
+        // collections of colliding squares, so there are no cracks to leak gas.
+        for (const auto& c : containers) {
+            painter.setPen(QPen(QColor(110, 125, 140), 5));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawLine(QPointF(c.left, c.top()), QPointF(c.left, c.bottom));
+            painter.drawLine(QPointF(c.right, c.top()), QPointF(c.right, c.bottom));
+            painter.drawLine(QPointF(c.left, c.bottom), QPointF(c.right, c.bottom));
+            painter.setPen(QPen(QColor(255, 140, 50), 8));
+            painter.drawLine(QPointF(c.left, c.top()), QPointF(c.right, c.top()));
+            painter.setPen(QColor(245, 220, 150));
+            painter.setFont(QFont("Consolas", 9, QFont::Bold));
+            painter.drawText(QPointF(c.left + 6, c.top() + 17),
+                QString("%1 kPa").arg(c.pressure, 0, 'f', 1));
+        }
+
         if (connection_start_obj && has_last_mouse) {
             painter.setPen(QPen(QColor(100, 200, 255, 200), 2, Qt::DashLine));
             painter.drawLine(connection_start_obj->position.to_qpointf(), last_mouse_pos);
@@ -567,6 +702,8 @@ protected:
         for (const auto& obj_ptr : balls) {
             PhysicsObject* obj = obj_ptr.get();
             if (!is_valid(obj->position) || !is_valid(obj->radius)) continue;
+
+            if (obj->is_container_piston) continue; // rendered as the face above
 
             if (obj->trail.size() > 2 && !obj->is_static && !obj->is_fluid && !obj->is_gas && !obj->is_ice) {
                 QPen t_pen(obj->color);
@@ -624,10 +761,14 @@ protected:
             double height_bb = std::max(10.0, max_y - min_y);
             double volume = width_bb * height_bb;
 
-            // Ideal Gas Law P = nRT/V
+            // Containers calculate this pressure each frame and use it to move
+            // their piston.  The bounding-box fallback is only for a free cloud.
             double r_const = 8.314;
             double temp_k = avg_temp + 273.15;
             double pressure = (gas_count * r_const * temp_k * 50.0) / volume;
+            for (const auto& c : containers) {
+                if (c.gas_particles > 0) { pressure = c.pressure; volume = c.volume(); break; }
+            }
 
             painter.setPen(QPen(QColor(150, 255, 100, 80), 2, Qt::DashLine));
             painter.setBrush(Qt::NoBrush);
@@ -679,6 +820,148 @@ protected:
     }
 
 private:
+    static double clamp(double value, double minimum, double maximum) {
+        return std::max(minimum, std::min(value, maximum));
+    }
+
+    void update_thermal_environment() {
+        // The background temperature is a finite thermal reservoir.  It slowly
+        // leaks to the user-selected room setpoint, receives heater/cooler power,
+        // and exchanges energy with every object.
+        double environment_energy = (ambient_setpoint - ambient_temperature)
+            * ambient_heat_capacity * 0.00025;
+
+        for (const auto& source_ptr : balls) {
+            PhysicsObject* source = source_ptr.get();
+            if (!source->is_heater && !source->is_cooler) continue;
+            const double power = source->is_heater ? 28.0 : -24.0;
+            environment_energy += power * 0.40;
+            for (const auto& target_ptr : balls) {
+                PhysicsObject* target = target_ptr.get();
+                if (target == source || target->is_heater || target->is_cooler) continue;
+                const double distance = (target->position - source->position).length();
+                const double reach = source->radius + target->radius + 70.0;
+                if (distance >= reach) continue;
+                const double proximity = 1.0 - distance / reach;
+                const double delivered = power * (0.10 + 0.90 * proximity * proximity);
+                target->add_heat(delivered);
+                environment_energy -= delivered;
+            }
+        }
+
+        for (const auto& object_ptr : balls) {
+            PhysicsObject* object = object_ptr.get();
+            if (object->is_heater || object->is_cooler) continue;
+            const double exchange = (object->temperature - ambient_temperature)
+                * heat_transfer_rate * 0.018 * std::sqrt(object->thermal_mass());
+            object->add_heat(-exchange);
+            environment_energy += exchange;
+        }
+        ambient_temperature = clamp(ambient_temperature + environment_energy / ambient_heat_capacity,
+                                    -200.0, 700.0);
+    }
+
+    void update_container_pressures() {
+        constexpr double r_const = 8.314;
+        constexpr double particle_moles = 50.0; // scaled particle amount for screen units
+        constexpr double atmospheric_pressure = 101.3;
+        for (auto& container : containers) {
+            container.gas_particles = 0;
+            container.average_temperature = ambient_temperature;
+            double total_temperature = 0.0;
+            for (const auto& object_ptr : balls) {
+                PhysicsObject* object = object_ptr.get();
+                if (object->is_gas && container.contains(*object)) {
+                    ++container.gas_particles;
+                    total_temperature += object->temperature;
+                }
+            }
+            if (container.gas_particles > 0) {
+                container.average_temperature = total_temperature / container.gas_particles;
+                container.pressure = (container.gas_particles * particle_moles * r_const
+                    * std::max(1.0, container.average_temperature + 273.15)) / container.volume();
+            } else {
+                container.pressure = atmospheric_pressure;
+            }
+
+            if (!container.piston) continue;
+            PhysicsObject* face = container.piston;
+            // Pressure on the underside competes with atmosphere and a small
+            // dashpot.  The piston is constrained to a vertical guide below.
+            const double face_area = container.right - container.left;
+            const double net_force = (container.pressure - atmospheric_pressure)
+                * face_area * 0.000020 - face->velocity.y * 0.18;
+            face->apply_force(Vector(0.0, -net_force));
+            face->position.x = (container.left + container.right) * 0.5;
+            face->velocity.x = 0.0;
+        }
+    }
+
+    void resolve_container_boundaries() {
+        for (auto& container : containers) {
+            if (!container.piston) continue;
+            PhysicsObject* face = container.piston;
+            face->position.x = (container.left + container.right) * 0.5;
+            face->velocity.x = 0.0;
+            if (face->position.y < container.piston_min_y) {
+                face->position.y = container.piston_min_y;
+                if (face->velocity.y < 0.0) face->velocity.y = 0.0;
+            }
+            if (face->position.y > container.piston_max_y) {
+                face->position.y = container.piston_max_y;
+                if (face->velocity.y > 0.0) face->velocity.y = 0.0;
+            }
+
+            for (const auto& object_ptr : balls) {
+                PhysicsObject* object = object_ptr.get();
+                if (object->is_static || object->is_container_piston) continue;
+                // A particle is associated with a vessel once it is inside its
+                // horizontal span and vertical travel range; this avoids trapping
+                // unrelated objects outside the vessel.
+                if (object->position.x < container.left - object->radius ||
+                    object->position.x > container.right + object->radius ||
+                    object->position.y < container.piston_min_y - object->radius ||
+                    object->position.y > container.bottom + object->radius) continue;
+
+                const double wall_e = object->is_gas ? 0.98 : (object->is_fluid ? 0.04 : 0.45);
+                if (object->position.x - object->radius < container.left) {
+                    object->position.x = container.left + object->radius;
+                    object->velocity.x = std::abs(object->velocity.x) * wall_e;
+                } else if (object->position.x + object->radius > container.right) {
+                    object->position.x = container.right - object->radius;
+                    object->velocity.x = -std::abs(object->velocity.x) * wall_e;
+                }
+                if (object->position.y + object->radius > container.bottom) {
+                    object->position.y = container.bottom - object->radius;
+                    object->velocity.y = -std::abs(object->velocity.y) * wall_e;
+                }
+                if (object->position.y - object->radius < container.top()) {
+                    object->position.y = container.top() + object->radius;
+                    const double relative_speed = object->velocity.y - face->velocity.y;
+                    if (relative_speed < 0.0) {
+                        const double impulse = -(1.0 + wall_e) * relative_speed;
+                        object->velocity.y += impulse;
+                        face->velocity.y -= impulse / std::max(10.0, face->mass);
+                    }
+                }
+            }
+        }
+    }
+
+    double collision_restitution(const PhysicsObject& first, const PhysicsObject& second) const {
+        const double collision_temperature = (first.temperature + second.temperature) * 0.5;
+        if (first.is_fluid || second.is_fluid) return 0.04;
+        if (first.is_gas && second.is_gas)
+            return clamp(0.997 - 0.00012 * std::abs(collision_temperature - 20.0), 0.90, 0.997);
+        if (first.is_gas || second.is_gas)
+            return clamp(0.78 - 0.0008 * std::max(0.0, collision_temperature - 20.0), 0.35, 0.78);
+        // Hotter solids become less elastic (a simple softening model); cold
+        // solids are a little springier.  This is applied to the material base.
+        const double temperature_factor = clamp(1.0 - 0.0015 * (collision_temperature - 20.0),
+                                                0.30, 1.12);
+        return clamp(std::min(first.elasticity, second.elasticity) * temperature_factor, 0.02, 0.98);
+    }
+
     void handle_spawning(double x, double y) {
         if (active_tool == ObjectType::BALL) spawn_at(x, y, ShapeType::CIRCLE);
         else if (active_tool == ObjectType::BOX) spawn_at(x, y, ShapeType::SQUARE);
@@ -726,19 +1009,7 @@ private:
             obj->temperature = -100.0;
             obj->color = QColor(60, 200, 255);
         } else if (active_tool == ObjectType::CONTAINER) {
-            // Overlapping squares by 2 units (radius=10 -> width=20, spacing=18) to create an airtight seal
-            for (int i = -6; i <= 6; ++i) {
-                auto obj = spawn_at(x + i*18, y + 90, ShapeType::SQUARE, 10, -1, true);
-                obj->color = QColor(100, 110, 120);
-            }
-            for (int i = -4; i <= 4; ++i) {
-                auto obj = spawn_at(x - 108, y + i*18, ShapeType::SQUARE, 10, -1, true);
-                obj->color = QColor(100, 110, 120);
-            }
-            for (int i = -4; i <= 4; ++i) {
-                auto obj = spawn_at(x + 108, y + i*18, ShapeType::SQUARE, 10, -1, true);
-                obj->color = QColor(100, 110, 120);
-            }
+            spawn_container(x, y);
         } else if (active_tool == ObjectType::BOMB) {
             auto obj = spawn_at(x, y, ShapeType::CIRCLE, 15, 10.0);
             obj->color = QColor(30, 30, 30);
@@ -801,25 +1072,34 @@ private:
                 Vector delta_pos = b1->position - b2->position;
                 double distance = delta_pos.length();
 
+                // Container piston faces are handled analytically so their wide
+                // visual bar cannot behave like an oversized solid square.
+                if (b1->is_container_piston || b2->is_container_piston) continue;
+
                 // Heat Transfer on Proximity/Collision (moved above static check so static ice can melt on static heaters)
                 if (distance > 0 && distance < (b1->radius + b2->radius + 15.0)) {
                     double heat_diff = b1->temperature - b2->temperature;
-                    double q = heat_diff * heat_transfer_rate;
-                    if (!b1->is_heater && !b1->is_cooler) b1->temperature -= q;
-                    if (!b2->is_heater && !b2->is_cooler) b2->temperature += q;
+                    double contact = 1.0 - distance / (b1->radius + b2->radius + 15.0);
+                    double q = heat_diff * heat_transfer_rate * contact * 0.12;
+                    b1->add_heat(-q);
+                    b2->add_heat(q);
                 }
 
                 if (b1->is_static && b2->is_static) continue;
 
                 // Fluids
                 if (b1->is_fluid && b2->is_fluid) {
-                    double smoothing_radius = b1->radius * 2.5;
+                    // Hot liquid expands a little and becomes less viscous;
+                    // cold liquid contracts and resists shear more strongly.
+                    double liquid_temperature = (b1->temperature + b2->temperature) * 0.5;
+                    double expansion = clamp(1.0 + 0.00030 * (liquid_temperature - 20.0), 0.94, 1.06);
+                    double smoothing_radius = b1->radius * 2.5 * expansion;
                     if (distance > 0 && distance < smoothing_radius) {
                         double q = 1.0 - (distance / smoothing_radius);
                         Vector normal = delta_pos * (1.0 / distance);
 
-                        double pressure = (q * q) * 2.0;
-                        double viscosity = fluid_viscosity;
+                        double pressure = (q * q) * 2.0 / expansion;
+                        double viscosity = fluid_viscosity * clamp(1.0 - 0.006 * (liquid_temperature - 20.0), 0.18, 3.0);
 
                         Vector push = normal * pressure;
                         b1->velocity += push * (1.0 / b1->mass);
@@ -853,17 +1133,7 @@ private:
                             b2->position -= normal * (overlap * (b1->mass / total_mass));
                         }
 
-                        // Determine Restitution based on state
-                        double restitution;
-                        if (b1->is_gas && b2->is_gas) {
-                            restitution = 1.0; // Perfectly elastic collisions for Ideal Gases
-                        } else if (b1->is_fluid || b2->is_fluid) {
-                            restitution = 0.1; // Fluids absorb impact
-                        } else if (b1->is_gas || b2->is_gas) {
-                            restitution = 0.5; // Gas hitting solid
-                        } else {
-                            restitution = std::min(b1->elasticity, b2->elasticity);
-                        }
+                        double restitution = collision_restitution(*b1, *b2);
 
                         Vector delta_vel = b1->velocity - b2->velocity;
                         double vel_along_normal = delta_vel.dot(normal);
@@ -905,6 +1175,8 @@ private:
 
     void game_loop() {
         if (!is_paused) {
+            update_thermal_environment();
+            update_container_pressures();
             for (auto& s : springs) s.update();
             for (auto& p : pulleys) p.update();
             for (auto& l : pistons) l.update();
@@ -924,6 +1196,8 @@ private:
                     }
                 }
             }
+
+            resolve_container_boundaries();
 
             for (auto* bomb : to_delete) {
                 remove_object(bomb);
@@ -1088,7 +1362,7 @@ private slots:
         add_slider("Bounciness", elas_slider, 10, 100, 80, 0, 1);
         add_slider("Wind Drag", wind_slider, 0, 50, 10, 0, 2);
 
-        add_slider("Ambient Temp (°C)", temp_slider, -100, 300, 20, 1, 0);
+        add_slider("Room Setpoint (°C)", temp_slider, -100, 300, 20, 1, 0);
         add_slider("Heat Transfer Rate", heat_slider, 0, 100, 5, 1, 1);
         add_slider("Fluid Viscosity", visc_slider, 0, 100, 5, 1, 2);
 
@@ -1158,7 +1432,7 @@ private slots:
         canvas->air_resistance = wind_slider->value() / 1000.0;
         canvas->elasticity = elas_slider->value() / 100.0;
 
-        canvas->ambient_temperature = temp_slider->value();
+        canvas->ambient_setpoint = temp_slider->value();
         canvas->heat_transfer_rate = heat_slider->value() / 100.0;
         canvas->fluid_viscosity = visc_slider->value() / 100.0;
 
