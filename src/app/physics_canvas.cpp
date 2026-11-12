@@ -4,7 +4,9 @@
 
 #include <QFont>
 #include <QFontMetrics>
+#include <QGuiApplication>
 #include <QMouseEvent>
+#include <QOpenGLWidget>
 #include <QPainter>
 #include <QPen>
 #include <QSurfaceFormat>
@@ -61,14 +63,65 @@ void draw_panel(QPainter& painter, const QRectF& rect) {
 }
 } // namespace
 
-PhysicsCanvas::PhysicsCanvas(QWidget* parent) : QOpenGLWidget(parent) {
-    QSurfaceFormat format = QSurfaceFormat::defaultFormat();
-    format.setVersion(3, 3);
-    format.setProfile(QSurfaceFormat::CoreProfile);
-    format.setDepthBufferSize(24);
-    format.setStencilBufferSize(8);
-    format.setSamples(4);
-    setFormat(format);
+// The OpenGL surface.  Mouse events pass through it to the canvas.
+class PhysicsCanvas::View : public QOpenGLWidget {
+public:
+    explicit View(PhysicsCanvas* canvas) : QOpenGLWidget(canvas), canvas_(canvas) {
+        QSurfaceFormat format = QSurfaceFormat::defaultFormat();
+        format.setVersion(3, 3);
+        format.setProfile(QSurfaceFormat::CoreProfile);
+        format.setDepthBufferSize(24);
+        format.setStencilBufferSize(8);
+        format.setSamples(4);
+        setFormat(format);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+    ~View() override {
+        if (renderer_.ready()) {
+            makeCurrent();
+            renderer_.release();
+            doneCurrent();
+        }
+    }
+
+protected:
+    void initializeGL() override { renderer_.initialize(); }
+    void paintGL() override {
+        PhysicsCanvas& c = *canvas_;
+        c.frame_ms_ += (double(c.paint_clock_.nsecsElapsed()) / 1e6 - c.frame_ms_) * 0.05;
+        c.paint_clock_.restart();
+
+        // The 3D scene is raw OpenGL; the HUD on top of it is drawn by QPainter,
+        // which has to be told when its GL state has been used by someone else.
+        QPainter painter(this);
+        const qreal dpr = devicePixelRatioF();
+        if (renderer_.ready()) {
+            painter.beginNativePainting();
+            renderer_.draw(c.world, c.camera, int(width() * dpr), int(height() * dpr), c.world.dragged(),
+                           double(c.run_clock_.elapsed()) / 1000.0);
+            painter.endNativePainting();
+        }
+        painter.setRenderHint(QPainter::Antialiasing);
+        if (!renderer_.ready()) {
+            painter.fillRect(rect(), QColor(30, 32, 38));
+            painter.setPen(QColor(229, 192, 123));
+            painter.setFont(mono(12));
+            painter.drawText(rect().adjusted(20, 20, -20, -20), Qt::AlignCenter | Qt::TextWordWrap,
+                             "The 3D view needs OpenGL 3.3.\n" + renderer_.error());
+        }
+        c.draw_overlay(painter);
+    }
+
+private:
+    PhysicsCanvas* canvas_;
+    Renderer renderer_;
+};
+
+PhysicsCanvas::PhysicsCanvas(QWidget* parent) : QWidget(parent) {
+    // Headless platforms have no OpenGL (and some Qt versions crash when an
+    // OpenGL widget is created on them), so the view is left out there.
+    const QString platform = QGuiApplication::platformName();
+    if (platform != "offscreen" && platform != "minimal") view_ = new View(this);
 
     setMouseTracking(true);              // hover readout and previews
     setFocusPolicy(Qt::ClickFocus);
@@ -81,19 +134,39 @@ PhysicsCanvas::PhysicsCanvas(QWidget* parent) : QOpenGLWidget(parent) {
     reset_view();
 }
 
-PhysicsCanvas::~PhysicsCanvas() {
-    if (renderer_.ready()) {
-        makeCurrent();
-        renderer_.release();
-        doneCurrent();
-    }
+PhysicsCanvas::~PhysicsCanvas() = default;
+
+void PhysicsCanvas::refresh() {
+    if (view_) view_->update();
+    else update();
+}
+
+QImage PhysicsCanvas::grab_view() {
+    return (view_ && view_->isValid()) ? view_->grabFramebuffer() : QImage();
+}
+
+void PhysicsCanvas::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    if (view_) view_->setGeometry(rect());
+}
+
+// Only reached without the OpenGL view: the overlay on a plain background.
+void PhysicsCanvas::paintEvent(QPaintEvent*) {
+    if (view_) return;
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.fillRect(rect(), QColor(22, 23, 28));
+    painter.setPen(QColor(150, 158, 172));
+    painter.setFont(mono(12));
+    painter.drawText(rect(), Qt::AlignCenter, "No OpenGL on this platform: the 3D view is not drawn.");
+    draw_overlay(painter);
 }
 
 void PhysicsCanvas::reset_view() {
     camera = Camera();
     camera.target = Vec3(0.5 * world.width, 0.38 * world.height, 0.5 * world.depth);
     camera.distance = 0.9 * std::max(world.width, 1.6 * world.height) + 0.6 * world.depth;
-    update();
+    refresh();
 }
 
 void PhysicsCanvas::restart(int initial_balls) {
@@ -102,7 +175,7 @@ void PhysicsCanvas::restart(int initial_balls) {
     for (int i = 0; i < initial_balls; ++i)
         world.spawn_ball(Vec3(random_double(40, world.width - 40), random_double(0.3 * world.height, 0.8 * world.height),
                               random_double(40, world.depth - 40)));
-    update();
+    refresh();
 }
 
 // A scene that shows most of what the sandbox does.
@@ -132,14 +205,14 @@ void PhysicsCanvas::load_demo() {
     world.spawn_car(Vec3(120, 60, 440));
     world.spawn_rope(Vec3(560, 520, 330));
     world.spawn_material = chosen;
-    update();
+    refresh();
 }
 
 void PhysicsCanvas::set_paused(bool paused) {
     paused_ = paused;
     accumulator_ms_ = 0.0;
     clock_.restart();
-    update();
+    refresh();
 }
 
 // Fixed timestep: the World always advances in 1/60 s steps, however often
@@ -159,7 +232,7 @@ void PhysicsCanvas::game_loop() {
             ++steps;
         }
         if (steps == kMaxStepsPerTick) accumulator_ms_ = 0.0;   // drop the backlog
-        if (steps > 0) update();
+        if (steps > 0) refresh();
     }
     // A link being drawn must not point at an object that has since been
     // removed (e.g. a bomb that went off).
@@ -182,7 +255,7 @@ void PhysicsCanvas::restore(const std::string& snapshot) {
     world.deserialize(snapshot);
     emit parameters_changed();
     emit history_changed();
-    update();
+    refresh();
 }
 
 bool PhysicsCanvas::undo() {
@@ -216,7 +289,7 @@ bool PhysicsCanvas::load_scene(const std::string& text, QString* error) {
     redo_stack_.clear();
     emit parameters_changed();
     emit history_changed();
-    update();
+    refresh();
     return true;
 }
 
@@ -300,7 +373,7 @@ void PhysicsCanvas::mousePressEvent(QMouseEvent* event) {
             finalize_polygon();
         else
             drawing_points_.push_back(spawn_point(pos));
-        update();
+        refresh();
         return;
     }
 
@@ -325,7 +398,7 @@ void PhysicsCanvas::mousePressEvent(QMouseEvent* event) {
         push_undo();
         handle_spawning(spawn_point(pos));
     }
-    update();
+    refresh();
 }
 
 void PhysicsCanvas::mouseMoveEvent(QMouseEvent* event) {
@@ -352,7 +425,7 @@ void PhysicsCanvas::mouseMoveEvent(QMouseEvent* event) {
             while (drag_samples_.size() > 16) drag_samples_.pop_front();
         }
     }
-    update();   // hover readout, previews
+    refresh();   // hover readout, previews
 }
 
 void PhysicsCanvas::mouseReleaseEvent(QMouseEvent* event) {
@@ -375,7 +448,7 @@ void PhysicsCanvas::mouseReleaseEvent(QMouseEvent* event) {
                 }
             }
         }
-        update();
+        refresh();
         return;
     }
     if (event->button() != Qt::LeftButton) return;
@@ -394,7 +467,7 @@ void PhysicsCanvas::mouseReleaseEvent(QMouseEvent* event) {
         connection_start_ = nullptr;
     }
     drag_samples_.clear();
-    update();
+    refresh();
 }
 
 void PhysicsCanvas::wheelEvent(QWheelEvent* event) {
@@ -408,13 +481,13 @@ void PhysicsCanvas::wheelEvent(QWheelEvent* event) {
         camera.zoom(steps);
     }
     event->accept();
-    update();
+    refresh();
 }
 
 void PhysicsCanvas::leaveEvent(QEvent* event) {
-    QOpenGLWidget::leaveEvent(event);
+    QWidget::leaveEvent(event);
     mouse_inside_ = false;
-    update();
+    refresh();
 }
 
 void PhysicsCanvas::handle_spawning(const Vec3& p) {
@@ -449,41 +522,12 @@ void PhysicsCanvas::finalize_polygon() {
         world.spawn_polygon(drawing_points_);
     }
     drawing_points_.clear();
-    update();
+    refresh();
 }
 
 // ============================================================
 // Rendering
 // ============================================================
-
-void PhysicsCanvas::initializeGL() {
-    renderer_.initialize();
-}
-
-void PhysicsCanvas::paintGL() {
-    frame_ms_ += (double(paint_clock_.nsecsElapsed()) / 1e6 - frame_ms_) * 0.05;
-    paint_clock_.restart();
-
-    // The 3D scene is raw OpenGL; the HUD on top of it is drawn by QPainter,
-    // which has to be told when its GL state has been used by someone else.
-    QPainter painter(this);
-    const qreal dpr = devicePixelRatioF();
-    if (renderer_.ready()) {
-        painter.beginNativePainting();
-        renderer_.draw(world, camera, int(width() * dpr), int(height() * dpr), world.dragged(),
-                       double(run_clock_.elapsed()) / 1000.0);
-        painter.endNativePainting();
-    }
-    painter.setRenderHint(QPainter::Antialiasing);
-    if (!renderer_.ready()) {
-        painter.fillRect(rect(), QColor(30, 32, 38));
-        painter.setPen(QColor(229, 192, 123));
-        painter.setFont(mono(12));
-        painter.drawText(rect().adjusted(20, 20, -20, -20), Qt::AlignCenter | Qt::TextWordWrap,
-                         "The 3D view needs OpenGL 3.3.\n" + renderer_.error());
-    }
-    draw_overlay(painter);
-}
 
 void PhysicsCanvas::draw_overlay(QPainter& painter) {
     const bool camera_moving = camera_button_ != Qt::NoButton && camera_moved_;

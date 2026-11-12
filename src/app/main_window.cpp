@@ -346,8 +346,8 @@ QImage MainWindow::screenshot() {
     // QWidget::grab() does not capture an OpenGL widget's overlay reliably,
     // so the 3D view is read back from its own framebuffer and pasted in.
     QImage image = grab().toImage();
-    if (canvas_ && canvas_->isVisible() && canvas_->isValid()) {
-        const QImage view = canvas_->grabFramebuffer();
+    if (canvas_ && canvas_->isVisible() && canvas_->has_3d_view()) {
+        const QImage view = canvas_->grab_view();
         if (!view.isNull()) {
             QPainter painter(&image);
             const QPoint origin = canvas_->mapTo(this, QPoint(0, 0));

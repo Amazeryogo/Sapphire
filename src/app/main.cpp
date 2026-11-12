@@ -43,7 +43,7 @@ int main(int argc, char* argv[]) {
             PhysicsCanvas* canvas = window.canvas();
             canvas->set_paused(true);
             for (int i = 0; i < count; ++i) canvas->world.step();
-            canvas->update();
+            canvas->refresh();
             QTimer::singleShot(200, &window, [&window, path]() {
                 const bool ok = window.screenshot().save(path);
                 std::printf("%s %s\n", ok ? "saved" : "could not save", qPrintable(path));

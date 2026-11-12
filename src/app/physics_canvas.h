@@ -2,15 +2,21 @@
 // Qt view/controller for the simulation: renders the World in 3D, turns mouse
 // input into edits and camera moves, runs the fixed-timestep loop and keeps
 // the undo history.
+//
+// The canvas itself is a plain widget that owns the input and the logic.  The
+// picture is drawn by an OpenGL child widget laid over it, which is only
+// created where OpenGL exists: on a headless platform (the "offscreen" one
+// the UI test runs on) the canvas works the same and simply shows no scene.
 
 #include "camera.h"
 #include "renderer.h"
 #include "world.h"
 
 #include <QElapsedTimer>
-#include <QOpenGLWidget>
+#include <QImage>
 #include <QPointF>
 #include <QTimer>
+#include <QWidget>
 
 #include <deque>
 #include <string>
@@ -21,7 +27,7 @@ enum class ObjectType {
     HEATER, COOLER, BOMB, CONTAINER, SPRING, PULLEY, PISTON
 };
 
-class PhysicsCanvas : public QOpenGLWidget {
+class PhysicsCanvas : public QWidget {
     Q_OBJECT
 public:
     explicit PhysicsCanvas(QWidget* parent = nullptr);
@@ -32,11 +38,16 @@ public:
 
     void restart(int initial_balls);
     void load_demo();
-    void set_tool(ObjectType tool) { active_tool_ = tool; drawing_points_.clear(); connection_start_ = nullptr; update(); }
+    void set_tool(ObjectType tool) { active_tool_ = tool; drawing_points_.clear(); connection_start_ = nullptr; refresh(); }
     bool is_paused() const { return paused_; }
     void set_paused(bool paused);
     void set_time_scale(double scale) { time_scale_ = scale; }
     void reset_view();
+    // Schedules a repaint of the 3D view.
+    void refresh();
+    bool has_3d_view() const { return view_ != nullptr; }
+    // Picture of the 3D view with its overlay (a null image without OpenGL).
+    QImage grab_view();
 
     // ---- History (snapshots of the whole scene) ----
     void push_undo();
@@ -61,8 +72,8 @@ signals:
     void parameters_changed();   // world parameters replaced (undo / load): resync the sliders
 
 protected:
-    void initializeGL() override;
-    void paintGL() override;
+    void paintEvent(QPaintEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
@@ -87,7 +98,8 @@ private:
     bool paused_ = false;
     double time_scale_ = 1.0;
 
-    Renderer renderer_;
+    class View;                      // the OpenGL child widget (physics_canvas.cpp)
+    View* view_ = nullptr;
     QTimer timer_;
     QElapsedTimer clock_;
     QElapsedTimer run_clock_;
