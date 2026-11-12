@@ -24,8 +24,8 @@ constexpr double kWaterMolarVaporHeat = 40660.0;          // J/mol (Clausius–C
 constexpr double kGasConstant  = 8.314;                   // J/(mol·K)
 constexpr double kAirMolarMass   = 28.97;
 constexpr double kSteamMolarMass = 18.015;
-// RMS particle speed (px/frame) of air at 20 °C.  v_rms ∝ sqrt(T / M).
-inline const double kGasSpeedScale = 2.0 / std::sqrt(293.15);
+// RMS particle speed (cm/frame) of air at 20 °C.  v_rms ∝ sqrt(T / M).
+inline const double kGasSpeedScale = 2.5 / std::sqrt(293.15);
 constexpr double kGasCollisionRate = 0.03; // Langevin relaxation rate (1/frame)
 // Hottest a gas particle can get from dissipated kinetic energy (a bomb
 // blast).  Energy beyond this is treated as radiated away.
@@ -59,6 +59,15 @@ inline double water_density(double celsius) {
 inline double water_viscosity_ratio(double celsius) {
     auto mu = [](double c) { return 2.414e-5 * std::pow(10.0, 247.8 / (kelvin(clampd(c, 0.0, 150.0)) - 140.0)); };
     return mu(celsius) / mu(20.0);
+}
+
+// Surface tension of water relative to 20 °C (IAPWS correlation).
+inline double water_surface_tension_ratio(double celsius) {
+    auto sigma = [](double c) {
+        const double tau = 1.0 - kelvin(clampd(c, 0.0, 370.0)) / 647.096;
+        return 235.8 * std::pow(tau, 1.256) * (1.0 - 0.625 * tau);
+    };
+    return sigma(celsius) / sigma(20.0);
 }
 
 inline double smoothstep(double edge0, double edge1, double x) {

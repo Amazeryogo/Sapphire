@@ -13,9 +13,13 @@ option(SAPPHIRE_BUILD_TESTS "Build the physics-core tests"     ON)
 # ---- Physics core: plain C++17, no Qt ----
 add_library(sapphire_core STATIC
     src/core/physics_object.cpp
+    src/core/collision.cpp
     src/core/constraints.cpp
     src/core/spatial_hash.cpp
     src/core/world.cpp
+    src/core/thermal.cpp
+    src/core/fluid.cpp
+    src/core/scene.cpp
     src/core/serialization.cpp
 )
 target_include_directories(sapphire_core PUBLIC src/core)
@@ -27,18 +31,25 @@ endif()
 
 # ---- Qt application ----
 if(SAPPHIRE_BUILD_APP)
-    find_package(Qt6 REQUIRED COMPONENTS Widgets)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
     add_library(sapphire_ui STATIC
+        src/app/camera.h
+        src/app/renderer.h
+        src/app/renderer.cpp
         src/app/physics_canvas.h
         src/app/physics_canvas.cpp
         src/app/main_window.h
         src/app/main_window.cpp
     )
     target_include_directories(sapphire_ui PUBLIC src/app)
-    target_link_libraries(sapphire_ui PUBLIC sapphire_core Qt6::Widgets)
+    target_link_libraries(sapphire_ui PUBLIC sapphire_core Qt6::Widgets Qt6::OpenGL Qt6::OpenGLWidgets)
     set_target_properties(sapphire_ui PROPERTIES AUTOMOC ON)
     if(NOT MSVC)
         target_compile_options(sapphire_ui PRIVATE -Wall -Wextra)
+    endif()
+    if(APPLE)
+        # Apple marks OpenGL as deprecated; it is still what the 3D view uses.
+        target_compile_definitions(sapphire_ui PUBLIC GL_SILENCE_DEPRECATION)
     endif()
 
     add_executable(sapphire WIN32 src/app/main.cpp)

@@ -1,28 +1,90 @@
 #include "physics_object.h"
 
-#include "random.h"
-
 namespace {
-constexpr Rgba kWaterColor{60, 150, 255, 200};
-constexpr Rgba kIceColor{150, 240, 255, 230};
-constexpr Rgba kSteamColor{225, 225, 235, 150};
-constexpr std::size_t kTrailLength = 12;
+constexpr double kPi = 3.14159265358979323846;
+constexpr Rgba kWaterColor{45, 135, 245, 255};
+constexpr Rgba kIceColor{170, 235, 255, 255};
+constexpr Rgba kSteamColor{230, 230, 240, 110};
 }
 
-PhysicsObject::PhysicsObject(double x, double y, double r, double el, double m, Rgba c,
-                             ShapeType st, bool is_stat, bool is_fl)
-    : position(x, y), previous_position(x, y), radius(r), liquid_radius(r), elasticity(el),
-      mass(m < 0.0 ? (r * r) / 100.0 : m), shape_type(st), is_static(is_stat), is_fluid(is_fl) {
-    if (!is_static) velocity = Vector(random_double(-2.0, 2.0), random_double(-2.0, 1.0));
-    pre_velocity = velocity;
+PhysicsObject::PhysicsObject(const Vec3& p, double r)
+    : position(p), previous_position(p), radius(r), liquid_radius(r) {
+    update_inertia();
+}
 
-    if (is_fluid) {
-        color = kWaterColor;
-    } else if (c.r >= 0) {
-        color = c;
-    } else {
-        color = Rgba{random_int(80, 255), random_int(80, 255), random_int(80, 255), 255};
+void PhysicsObject::make_sphere(double r) {
+    shape_type = ShapeType::SPHERE;
+    radius = r;
+    liquid_radius = r;
+    half_extents = Vec3();
+    update_inertia();
+}
+
+void PhysicsObject::make_box(const Vec3& half) {
+    shape_type = ShapeType::BOX;
+    half_extents = half;
+    radius = half.length();
+    update_inertia();
+}
+
+double PhysicsObject::volume() const {
+    if (shape_type == ShapeType::BOX) return 8.0 * half_extents.x * half_extents.y * half_extents.z;
+    return 4.0 / 3.0 * kPi * radius * radius * radius;
+}
+
+double PhysicsObject::surface_area() const {
+    if (shape_type == ShapeType::BOX) {
+        const Vec3& h = half_extents;
+        return 8.0 * (h.x * h.y + h.y * h.z + h.z * h.x);
     }
+    return 4.0 * kPi * radius * radius;
+}
+
+double PhysicsObject::support(const Vec3& direction) const {
+    if (shape_type != ShapeType::BOX) return radius;
+    const Vec3 local = orientation.inv_rotate(direction);
+    return std::abs(local.x) * half_extents.x + std::abs(local.y) * half_extents.y + std::abs(local.z) * half_extents.z;
+}
+
+void PhysicsObject::set_material(Material m) {
+    material = m;
+    const MaterialProps& props = material_props(m);
+    is_bouncy = (m == Material::Rubber);
+    if (!is_bouncy) elasticity = props.restitution;
+    set_mass(props.density * kWaterDensity * volume());
+}
+
+void PhysicsObject::set_mass(double m) {
+    mass = std::max(1e-6, m);
+    update_inertia();
+}
+
+void PhysicsObject::update_inertia() {
+    if (shape_type == ShapeType::BOX) {
+        const Vec3& h = half_extents;
+        const double k = mass / 3.0;
+        const Vec3 inertia(k * (h.y * h.y + h.z * h.z), k * (h.x * h.x + h.z * h.z), k * (h.x * h.x + h.y * h.y));
+        inv_inertia_body = Vec3(inertia.x > 0.0 ? 1.0 / inertia.x : 0.0,
+                                inertia.y > 0.0 ? 1.0 / inertia.y : 0.0,
+                                inertia.z > 0.0 ? 1.0 / inertia.z : 0.0);
+    } else {
+        const double inertia = 0.4 * mass * radius * radius;      // solid sphere
+        const double inv = inertia > 0.0 ? 1.0 / inertia : 0.0;
+        inv_inertia_body = Vec3(inv, inv, inv);
+    }
+}
+
+double PhysicsObject::kinetic_energy() const {
+    if (is_static) return 0.0;
+    double e = 0.5 * mass * velocity.length_sq();
+    if (can_rotate()) {
+        const Vec3 w = orientation.inv_rotate(angular_velocity);
+        const Vec3& ii = inv_inertia_body;
+        if (ii.x > 0.0) e += 0.5 * w.x * w.x / ii.x;
+        if (ii.y > 0.0) e += 0.5 * w.y * w.y / ii.y;
+        if (ii.z > 0.0) e += 0.5 * w.z * w.z / ii.z;
+    }
+    return e;
 }
 
 double PhysicsObject::effective_restitution() const {
@@ -46,12 +108,12 @@ void PhysicsObject::become_liquid() {
 void PhysicsObject::become_ice() {
     phase_event = PhaseEvent::Froze;
     is_fluid = false; is_gas = false; is_steam = false;
-    // Ice is a free rigid solid now: it falls, and floats because the World
+    // Ice is a free rigid solid: it falls, and floats because the World
     // bonds it into a lattice that is ~9 % less dense than the water.
     is_ice = true;
     radius = liquid_radius * 1.03;   // ice is ~9 % less dense: (1.09)^(1/3)
     elasticity = 0.05; is_bouncy = false;
-    angular_velocity = 0.0;
+    angular_velocity = Vec3();
     color = kIceColor;
 }
 
@@ -132,7 +194,3 @@ void PhysicsObject::add_heat(double energy) {
     }
 }
 
-void PhysicsObject::update_trail() {
-    trail.push_back(position);
-    if (trail.size() > kTrailLength) trail.erase(trail.begin());
-}
